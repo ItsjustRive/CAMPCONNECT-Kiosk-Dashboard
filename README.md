@@ -7,10 +7,10 @@
 Reason: 
 Because the env prevent you to store real data. I always did the env so i can test it always change things in there easily.
 3. Run `py -m pip install -r requirements.txt`.
-4.  Run `py setup_owner.py`. Keep the suggested owner username `Administrator` (to easily distiquish), then enter the owner password you chose at the hidden password prompt (if you dont see anything when you type it is okay just remember what you type and type it again for comfirmation.). It is hashed before storage so your password  is not saved in project files as char. You can only choose one owner so better remember the password and if you use env it wouldnt it's like you're maing fake env so all this will start anew again after you remove the env. 
+4. Run `py setup_owner.py`. Keep the suggested owner username `Administrator` (to easily distiquish), then enter the owner password you chose at the hidden password prompt (if you don't see anything when you type it is okay just remember what you type and type it again for comfirmation.). It is hashed before storage so your password  is not saved in project files as char. You can only choose one owner so better remember the password and if you use env it wouldn't save as final 'owner' it's like you're main is a fake main, env so all this will start anew again after you remove the env. 
 Also the password is 10 char long. It will not acceot any shorter password.
 5. Run `py server.py` and open `http://127.0.0.1:5000/login`.
-6.Sign in as owner, then create staff accounts from the **Staff accounts** panel. Staff passwords must be at least 10 characters.
+6. Sign in as owner, then create staff accounts from the **Staff accounts** panel. Staff passwords must be at least 10 characters.
 
 The sign-in page includes an on-screen keyboard with letters, digits, symbols, shift, space, backspace, and clear. because it did supports the staff and owner login form, and password input stays masked.
 
