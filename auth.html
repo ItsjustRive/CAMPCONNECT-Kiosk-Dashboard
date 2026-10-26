@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Balakbak · Sign in</title><link rel="stylesheet" href="/auth.css"></head>
+<body><main class="login-card">
+<a class="brand" href="/camper.html"><span>▲</span><b>CAMPCONNECT CHARGING STATION <small>KIOSK CONTROL</small></b></a><a class="return-camper" href="/camper.html">← Return to camper screen</a><p class="eyebrow">AUTHORIZED ACCESS ONLY!</p><h1>Staff &amp; owner sign in</h1><p class="muted">Choose your account type and enter your credentials.</p>
+<form id="loginForm"><label>Account type<select id="role"><option value="staff">Staff</option><option value="owner">Owner / Administrator</option></select></label><label>Username<input id="username" autocomplete="username" required></label><label>Password<input id="password" type="password" autocomplete="current-password" required></label><p class="error" id="error" aria-live="polite"></p><button class="sign-in" type="submit">Sign in</button></form>
+<section class="keyboard" aria-label="On-screen keyboard"><div class="key-row" data-keys="1234567890"></div><div class="key-row" data-keys="qwertyuiop"></div><div class="key-row" data-keys="asdfghjkl"></div><div class="key-row" data-keys="zxcvbnm"></div><div class="key-row" data-keys="-_@.#"></div><div class="key-row special"><button type="button" data-key="shift">⇧ Shift</button><button type="button" data-key="space">Space</button><button type="button" data-key="backspace">⌫ Backspace</button><button type="button" data-key="clear">Clear</button></div></section>
+<p class="hint">Tap a field, then use the on-screen keyboard. Password characters stay masked.</p>
+</main><script src="/auth.js"></script></body></html>

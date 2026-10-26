@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0f2a3a">
+  <title>CampConnect | Phone link</title>
+  <link rel="stylesheet" href="phone.css">
+</head>
+<body>
+  <main class="phone-shell">
+    <header class="phone-header"><span class="mark">▲</span><div><b>CAMPCONNECT</b><small>LOCAL PHONE LINK</small></div><span id="linkState" class="link-state">Checking Wi-Fi</span></header>
+    <section id="loginPanel" class="card">
+      <p class="eyebrow">CAMPSITE ACCESS</p><h1>Sign in on this phone</h1>
+      <p>Use your staff or owner account. This page connects directly to the kiosk over the local Wi-Fi network.</p>
+      <form id="loginForm"><label>Account type<select name="role"><option value="staff">Staff</option><option value="owner">Owner</option></select></label><label>Username<input name="username" required autocomplete="username"></label><label>Password<input name="password" required type="password" autocomplete="current-password"></label><button class="primary" type="submit">Sign in</button><p id="loginError" class="error" aria-live="polite"></p></form>
+    </section>
+    <section id="appPanel" hidden>
+      <div class="welcome"><div><p class="eyebrow">KIOSK PHONE LINK</p><h1>Camp site updates</h1><p id="accountLabel">Signed in</p></div><button id="signOut" class="light">Sign out</button></div>
+      <section class="card"><div class="section-title"><div><h2>Emergency messages</h2><p>New alerts appear here while this page is open.</p></div><span id="newCount" class="count">0 new</span></div><div id="alerts" class="alert-list"><p class="empty">Loading alerts…</p></div></section>
+      <section class="card"><div class="section-title"><div><h2 id="sessionsHeading">Active locker sessions</h2><p>Current camper and locker status from the kiosk.</p></div></div><div class="table-wrap"><table><thead><tr><th>CAMPER</th><th>LOCKER</th><th>STARTED</th><th>PAID</th><th>TIME PAID</th><th>TIME USED</th><th>STATUS</th></tr></thead><tbody id="sessions"><tr><td colspan="7" class="empty">Loading sessions…</td></tr></tbody></table></div></section>
+      <section id="reportsPanel" class="card" hidden><div class="section-title"><div><h2>Report files</h2><p>Download report exports saved on the kiosk.</p></div></div><div id="reports" class="report-list"><p class="empty">Loading files…</p></div></section>
+      <p id="appMessage" class="app-message" aria-live="polite">Connected to the kiosk's local network service.</p>
+    </section>
+    <footer>Local network only · Keep staff and owner passwords private.</footer>
+  </main>
+  <script src="phone.js"></script>
+</body>
+</html>
