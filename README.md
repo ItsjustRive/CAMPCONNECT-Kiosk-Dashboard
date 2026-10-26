@@ -1,4 +1,4 @@
-# CAMPCONECT-Kiosk-Dashboard
+# CAMPCONNECT-Kiosk-Dashboard
 
 # Balakbak system how to install!
 
