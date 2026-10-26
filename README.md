@@ -29,7 +29,7 @@ The sign-in page includes an on-screen keyboard with letters, digits, symbols, s
 2. The coin acceptor, locker relay/door sensor, power sensors, LoRa radio, completed-session storage, and real financial totals are not connected yet. In normal mode the payment screen shows ₱0 and 0 minutes, and the coin-slot status says not connected. Staff health readings show unavailable/offline until sensors and radio are integrated. The owner report currently contains its column headings only. The future coin-slot driver can call `window.acceptKioskCoin(5)`, `window.acceptKioskCoin(10)`, or `window.acceptKioskCoin(20)` when it detects a coin pulse. Connect the GPIO coin-slot driver, locker controller, sensors, LoRa radio, and session database before using the system for real campsite operations.
 3. The server binds to all network interfaces on port 5000 for local development. Restrict network access to the trusted kiosk/management network before connecting it to Wi-Fi, and do not expose this development server to the public internet. Keep the `data` folder private because it will contain camper records and report exports. The owner can permanently delete report exports from the dashboard; deletion cannot be undone.
 
-## Page files and what they are and if ever you have to change something there's comment for their theme
+## Page files and what they are and if ever you have to change something there's comment for each of their function.
 
 - `camper.html`, `camper.css`, `camper.js` — camper locker, PIN, charging, and SOS screens.
 - `staff.html`, `staff.css`, `staff.js` — staff recovery interface and maintenance health display.
