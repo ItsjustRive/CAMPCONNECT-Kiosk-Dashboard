@@ -198,3 +198,4 @@ input,select,textarea,button{max-width:100%}
 .shell>section:nth-of-type(2n){animation-delay:.08s}
 @media(max-width:1000px){#chart,#costs-box,#team,#files{grid-column:1/-1}}
 @media(max-width:560px){.shell{gap:16px}.jump{flex-wrap:nowrap!important;overflow-x:auto!important}.jump a{white-space:nowrap}}
+ .sos-alert-enable{border:2px solid #153d32;border-radius:9px;background:#fff1bd;color:#153d32;padding:8px 11px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}.sos-alert-enable.enabled{background:#b8f0e4}.sos-alert-enable:focus-visible{outline:3px solid #ffbe2e;outline-offset:2px}
