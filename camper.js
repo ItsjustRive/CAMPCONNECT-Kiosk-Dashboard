@@ -7,6 +7,7 @@ let toastTimer;
 let currentKioskLocation = null, currentTransport = null;
 let feedbackRating = 0, feedbackContext = { sessionId: null, demoRecordId: null, locker: null }, feedbackShift = false;
 let doorPollTimer = null;
+let responderPopupKey = null, responderPopupTimer = null, camperReplyAlertId = null, camperReplyShift = false;
 const demoSessionStorageKey = 'campconnect-active-demo-session';
 
 // The locker bridge may expose this adapter before camper.js loads.
@@ -37,6 +38,59 @@ function updateKioskGps(data) {
     ? `Kiosk GPS fix · ${Number(data.latitude).toFixed(5)}, ${Number(data.longitude).toFixed(5)}${data.gps_accuracy_m == null ? '' : ` · accuracy ±${Math.round(Number(data.gps_accuracy_m))} m`}`
     : 'Kiosk GPS unavailable · SOS can still include typed location details.';
 }
+function rescueDistance(aLat, aLon, bLat, bLon) {
+  const rad = value => value * Math.PI / 180;
+  const dLat = rad(bLat - aLat), dLon = rad(bLon - aLon);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLon / 2) ** 2;
+  const meters = 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return meters < 1000 ? `About ${Math.round(meters)} m` : `About ${(meters / 1000).toFixed(2)} km`;
+}
+function showRescueMessage(message) {
+  const popup = $('#rescuePopup');
+  $('#rescuePopupText').textContent = message;
+  popup.hidden = false;
+  clearTimeout(responderPopupTimer);
+  responderPopupTimer = setTimeout(() => { popup.hidden = true; }, 10000);
+}
+function renderLiveRescue(data) {
+  const panel = $('#liveRescue');
+  const alert = data.active_sos;
+  panel.hidden = !alert;
+  if (!alert) return;
+  $('#liveRescueTitle').textContent = alert.alert_type || 'Emergency response';
+  $('#liveRescueState').textContent = alert.status || 'SOS active';
+  $('#liveRescueDetails').textContent = alert.details || 'No additional details provided.';
+  const name = alert.responder_username || (data.responder_alert_id === alert.id ? data.responder_username : null);
+  const role = alert.responder_role || (data.responder_alert_id === alert.id ? data.responder_role : null);
+  $('#liveRescueResponder').textContent = name ? `${name}${role ? ` · ${role === 'owner' ? 'Owner' : 'Staff'}` : ''}` : role ? `${role === 'owner' ? 'Owner' : 'Staff'} responding` : alert.status === 'Responder en route' ? 'Responder en route' : 'Waiting for response';
+  const matchingTelemetry = data.responder_alert_id === alert.id;
+  const bLat = alert.responder_latitude ?? (matchingTelemetry ? data.responder_latitude : null);
+  const bLon = alert.responder_longitude ?? (matchingTelemetry ? data.responder_longitude : null);
+  const updatedAt = alert.responder_location_at || (matchingTelemetry ? data.responder_updated_at : null);
+  const fresh = updatedAt && Date.now() - Date.parse(updatedAt) < 120000;
+  const validB = fresh && Number.isFinite(Number(bLat)) && Number.isFinite(Number(bLon));
+  $('#liveRescueLocation').textContent = validB
+    ? `${Number(bLat).toFixed(5)}, ${Number(bLon).toFixed(5)}${(alert.responder_accuracy_m ?? data.responder_accuracy_m) == null ? '' : ` · ±${Math.round(Number(alert.responder_accuracy_m ?? data.responder_accuracy_m))} m`}`
+    : updatedAt ? 'Responder GPS fix is stale' : 'Waiting for LoRa GPS';
+  $('#liveRescueUpdated').textContent = validB ? `Updated ${new Date(updatedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : '';
+  const aLat = alert.latitude ?? currentKioskLocation?.latitude;
+  const aLon = alert.longitude ?? currentKioskLocation?.longitude;
+  $('#liveRescueDistance').textContent = validB && Number.isFinite(Number(aLat)) && Number.isFinite(Number(aLon))
+    ? rescueDistance(Number(aLat), Number(aLon), Number(bLat), Number(bLon))
+    : 'Unavailable until both fresh GPS fixes arrive';
+  const message = alert.responder_message || (matchingTelemetry ? data.responder_message : null);
+  const messageEl = $('#liveRescueMessage');
+  messageEl.hidden = !message;
+  messageEl.textContent = message ? `Responder update: ${message}` : '';
+  const messageKey = message ? `${alert.id}:${alert.responder_message_at || alert.responded_at || message}` : null;
+  if (message && messageKey !== responderPopupKey) {
+    responderPopupKey = messageKey;
+    showRescueMessage(message);
+  }
+  const replyButton = $('#camperReplyOpen');
+  replyButton.hidden = !message || Boolean(alert.camper_reply_at);
+  replyButton.dataset.alertId = alert.id;
+}
 async function refreshTransportStatus() {
   try {
     const response = await fetch('/api/connectivity/status', { cache: 'no-store' });
@@ -53,6 +107,7 @@ async function refreshTransportStatus() {
     $('#solarStatus').className = batteryAvailable ? 'status' : 'status neutral';
     $('#solarStatus').innerHTML = `<i class="battery"></i> ${batteryAvailable ? `Battery ${Math.round(Number(data.battery_percent))}%` : 'Battery unavailable'}`;
     updateKioskGps(data);
+    renderLiveRescue(data);
     if (viewerRole === 'owner' && demoMode) {
       $('#sosStatus').textContent = activeLink === 'lora'
         ? 'Demo SOS will be sent through the LoRa bridge and appear on the local phone inbox.'
@@ -648,6 +703,79 @@ for (const id of ['nameDialog', 'pinDialog', 'paymentDialog']) {
   document.getElementById(id).addEventListener('cancel', () => resetSession(false));
 }
 
+const camperReplyField = $('#camperReplyText');
+function updateCamperReplyCounter() {
+  const length = [...camperReplyField.value].length;
+  $('#camperReplyCount').textContent = `${length} / 100 characters`;
+  $('#sendCamperReply').disabled = length === 0 || length > 100;
+}
+function buildCamperReplyKeyboard() {
+  const host = $('#camperReplyKeyboard');
+  ['1234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm', '.,!?-'].forEach(keys => {
+    const row = document.createElement('div');
+    row.className = 'reply-key-row';
+    [...keys].forEach(key => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'reply-key';
+      button.dataset.replyKey = key; button.textContent = key;
+      row.append(button);
+    });
+    host.append(row);
+  });
+  const controls = document.createElement('div');
+  controls.className = 'reply-key-row reply-key-controls';
+  [['shift', 'Shift'], ['space', 'Space'], ['back', '⌫'], ['clear', 'Clear']].forEach(([key, label]) => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'reply-key utility';
+    button.dataset.replyKey = key; button.textContent = label;
+    controls.append(button);
+  });
+  host.append(controls);
+}
+$('#camperReplyOpen').addEventListener('click', event => {
+  camperReplyAlertId = event.currentTarget.dataset.alertId;
+  camperReplyField.value = '';
+  camperReplyShift = false;
+  $('#camperReplyStatus').textContent = '';
+  updateCamperReplyCounter();
+  $('#camperReplyDialog').showModal();
+});
+$('#camperReplyKeyboard').addEventListener('click', event => {
+  const button = event.target.closest('[data-reply-key]');
+  if (!button) return;
+  const key = button.dataset.replyKey;
+  let value = [...camperReplyField.value];
+  if (key === 'shift') { camperReplyShift = !camperReplyShift; button.classList.toggle('selected', camperReplyShift); return; }
+  if (key === 'back') value.pop();
+  else if (key === 'clear') value = [];
+  else if (key === 'space' && value.length < 100 && value.length) value.push(' ');
+  else if (key.length === 1 && value.length < 100) { value.push(camperReplyShift ? key.toUpperCase() : key); camperReplyShift = false; $('#camperReplyKeyboard [data-reply-key="shift"]').classList.remove('selected'); }
+  camperReplyField.value = value.join('');
+  updateCamperReplyCounter();
+});
+$('#camperReplyForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const message = camperReplyField.value.trim();
+  if (!camperReplyAlertId || !message || [...message].length > 100) return;
+  const send = $('#sendCamperReply');
+  send.disabled = true; send.textContent = 'Sending…';
+  $('#camperReplyStatus').textContent = '';
+  try {
+    const response = await fetch(`/api/camper/alerts/${encodeURIComponent(camperReplyAlertId)}/reply`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || 'Could not send the message.');
+    $('#camperReplyDialog').close();
+    camperReplyAlertId = null;
+    $('#camperReplyOpen').hidden = true;
+    toast('Message sent. The responder cannot reply to this message.');
+    refreshTransportStatus();
+  } catch (error) { $('#camperReplyStatus').textContent = error.message; }
+  finally { send.textContent = 'Send reply'; updateCamperReplyCounter(); }
+});
+buildCamperReplyKeyboard();
+
 $('#sosOpen').addEventListener('click', () => open('sosDialog'));
 const sosDetails = $('#sosDetails');
 const sosDetailsCounter = $('#sosDetailsCounter');
@@ -931,4 +1059,4 @@ fetch('/api/me').then(response => {
   if (session?.status === 'charging') renderLockerState('charging');
 }).catch(() => {});
 refreshTransportStatus();
-setInterval(refreshTransportStatus, 10000);
+setInterval(refreshTransportStatus, 5000);
