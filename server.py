@@ -19,6 +19,7 @@ from flask import Flask, abort, jsonify, redirect, request, send_file, send_from
 from werkzeug.security import check_password_hash
 
 ROOT = Path(__file__).resolve().parent
+PHONE_APP_ROOT = ROOT.parent / "phone campconnect"
 DATA = ROOT / "data"
 REPORTS = DATA / "reports"
 DB = DATA / "kiosk.sqlite3"
@@ -47,7 +48,8 @@ app.config["HARDWARE_STATUS"] = {
     "energy_meter_detected": False, "energy_kwh": None,
     "gps_fix": False, "latitude": None, "longitude": None, "gps_accuracy_m": None,
     "gps_updated_at": None, "responder_latitude": None, "responder_longitude": None,
-    "responder_updated_at": None, "responder_alert_id": None,
+    "responder_accuracy_m": None, "responder_username": None, "responder_role": None,
+    "responder_updated_at": None, "responder_alert_id": None, "responder_message": None,
 }
 
 def default_demo_sessions():
@@ -118,7 +120,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS emergency_alerts (
             id TEXT PRIMARY KEY, alert_type TEXT NOT NULL, details TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'New', created_at TEXT NOT NULL,
-            resolved_at TEXT, latitude REAL, longitude REAL, gps_accuracy_m REAL
+            resolved_at TEXT, latitude REAL, longitude REAL, gps_accuracy_m REAL,
+            sent_at TEXT, responder_username TEXT, responder_role TEXT, responded_at TEXT,
+            resolved_by TEXT, resolved_role TEXT, responder_latitude REAL,
+            responder_longitude REAL, responder_accuracy_m REAL, responder_location_at TEXT, responder_source TEXT,
+            responder_message TEXT, responder_message_at TEXT,
+            camper_reply_message TEXT, camper_reply_at TEXT
         );
         CREATE TABLE IF NOT EXISTS camper_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT, locker TEXT NOT NULL,
@@ -128,11 +135,19 @@ def init_db():
         INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('communication_mode','lora',CURRENT_TIMESTAMP);
         """)
         emergency_columns = {row[1] for row in con.execute("PRAGMA table_info(emergency_alerts)").fetchall()}
-        for column in ("latitude", "longitude", "gps_accuracy_m"):
+        emergency_migrations = {
+            "latitude": "REAL", "longitude": "REAL", "gps_accuracy_m": "REAL",
+            "is_demo": "INTEGER NOT NULL DEFAULT 0", "sent_at": "TEXT",
+            "responder_username": "TEXT", "responder_role": "TEXT", "responded_at": "TEXT",
+            "resolved_by": "TEXT", "resolved_role": "TEXT", "responder_latitude": "REAL",
+            "responder_longitude": "REAL", "responder_accuracy_m": "REAL", "responder_location_at": "TEXT",
+            "responder_source": "TEXT",
+            "responder_message": "TEXT",
+            "responder_message_at": "TEXT", "camper_reply_message": "TEXT", "camper_reply_at": "TEXT",
+        }
+        for column, column_type in emergency_migrations.items():
             if column not in emergency_columns:
-                con.execute(f"ALTER TABLE emergency_alerts ADD COLUMN {column} REAL")
-        if "is_demo" not in emergency_columns:
-            con.execute("ALTER TABLE emergency_alerts ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+                con.execute(f"ALTER TABLE emergency_alerts ADD COLUMN {column} {column_type}")
         # A process restart ends the in-memory demo; discard its leftover alerts too.
         con.execute("DELETE FROM emergency_alerts WHERE is_demo=1")
         feedback_columns = {row[1] for row in con.execute("PRAGMA table_info(camper_feedback)").fetchall()}
@@ -431,7 +446,7 @@ def login_page():
 
 @app.get("/<path:asset>")
 def page_or_asset(asset):
-    allowed_assets = {"auth.css", "auth.js", "camper.html", "camper.css", "camper.js", "staff.html", "staff.css", "staff.js", "owner.html", "owner.css", "owner.js", "phone.html", "phone.css", "phone.js", "index.html", "portal.css"}
+    allowed_assets = {"auth.css", "auth.js", "camper.html", "camper.css", "camper.js", "staff.html", "staff.css", "staff.js", "owner.html", "owner.css", "owner.js", "sos-alerts.js", "index.html", "portal.css"}
     if asset not in allowed_assets:
         abort(404)
     if asset.startswith("owner.") or asset == "owner.html":
@@ -442,6 +457,19 @@ def page_or_asset(asset):
     if asset == "owner.html" and session.get("role") != "owner":
         return redirect("/login")
     return send_from_directory(ROOT, asset)
+
+
+@app.get("/mobile/")
+def mobile_app():
+    return send_from_directory(PHONE_APP_ROOT, "index.html")
+
+
+@app.get("/mobile/<path:asset>")
+def mobile_app_asset(asset):
+    allowed_assets = {"app.css", "app.js", "manifest.webmanifest", "icon.svg", "IOS_Emergency_Alert_Notification_-_Sound_Effect_HD.wav"}
+    if asset not in allowed_assets:
+        abort(404)
+    return send_from_directory(PHONE_APP_ROOT, asset)
 
 
 @app.post("/api/login")
@@ -486,7 +514,11 @@ def connectivity_status():
     gps_fix = bool(hardware.get("gps_fix") and hardware.get("latitude") is not None and hardware.get("longitude") is not None)
     with connect_db() as con:
         active_sos_row = con.execute("""
-            SELECT id,status,latitude,longitude,created_at FROM emergency_alerts
+            SELECT id,status,alert_type,details,latitude,longitude,gps_accuracy_m,created_at,sent_at,
+                   responder_username,responder_role,responded_at,responder_latitude,responder_longitude,
+                   responder_accuracy_m,responder_location_at,responder_source,responder_message,
+                   responder_message_at,camper_reply_message,camper_reply_at
+            FROM emergency_alerts
             WHERE status!='Resolved' ORDER BY created_at DESC LIMIT 1
         """).fetchone()
     active_sos = dict(active_sos_row) if active_sos_row else None
@@ -501,13 +533,17 @@ def connectivity_status():
                    gps_updated_at=hardware.get("gps_updated_at"),
                    responder_latitude=hardware.get("responder_latitude"),
                    responder_longitude=hardware.get("responder_longitude"),
+                   responder_accuracy_m=hardware.get("responder_accuracy_m"),
+                   responder_username=hardware.get("responder_username"),
+                   responder_role=hardware.get("responder_role"),
                    responder_updated_at=hardware.get("responder_updated_at"),
                    responder_alert_id=hardware.get("responder_alert_id"),
+                   responder_message=hardware.get("responder_message"),
                    active_sos=active_sos,
                    wifi_adapter_available=wifi_adapter_available(), ethernet_connected=ethernet_connected,
                    network_type="Wi-Fi" if wifi_connected else "Ethernet" if ethernet_connected else None,
                    lan_ip=lan_ip if phone_link_available else None,
-                   phone_url=f"http://{lan_ip}:5000/phone.html" if phone_link_available and lan_ip else None)
+                   phone_url=f"http://{lan_ip}:5000/mobile/" if phone_link_available and lan_ip else None)
 
 
 @app.post("/api/emergency")
@@ -544,8 +580,9 @@ def create_emergency_alert():
     created = now_iso()
     delivery_status = "Queued for LoRa" if transport == "lora" else "New"
     with connect_db() as con:
-        con.execute("INSERT INTO emergency_alerts(id,alert_type,details,status,created_at,latitude,longitude,gps_accuracy_m,is_demo) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (alert_id, alert_type, details, delivery_status, created, latitude, longitude, accuracy, int(app.config["DEMO_ACTIVE"])))
+        sent_at = None if transport == "lora" else created
+        con.execute("INSERT INTO emergency_alerts(id,alert_type,details,status,created_at,latitude,longitude,gps_accuracy_m,is_demo,sent_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (alert_id, alert_type, details, delivery_status, created, latitude, longitude, accuracy, int(app.config["DEMO_ACTIVE"]), sent_at))
     return jsonify(ok=True, id=alert_id, created_at=created, transport=transport,
                    queued=transport == "lora", demo=bool(app.config["DEMO_ACTIVE"]), gps_attached=latitude is not None), 201
 
@@ -562,6 +599,16 @@ def hardware_emergency_outbox():
     return jsonify(alerts=[dict(row) for row in rows])
 
 
+@app.get("/api/hardware/sos-buzzer")
+def hardware_sos_buzzer_state():
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return jsonify(error="SOS buzzer state is available only to the local hardware bridge."), 403
+    with connect_db() as con:
+        rows = con.execute("SELECT id,status,created_at FROM emergency_alerts WHERE status!='Resolved' AND responded_at IS NULL ORDER BY created_at ASC").fetchall()
+    alerts = [dict(row) for row in rows]
+    return jsonify(buzzer_active=bool(alerts), alert_ids=[alert["id"] for alert in alerts], alerts=alerts)
+
+
 @app.post("/api/hardware/emergency-outbox/<alert_id>/ack")
 def acknowledge_hardware_emergency(alert_id):
     if request.remote_addr not in {"127.0.0.1", "::1"}:
@@ -572,7 +619,8 @@ def acknowledge_hardware_emergency(alert_id):
         return jsonify(error="Provide sent as true or false."), 400
     next_status = "Sent over LoRa" if sent else "LoRa send failed"
     with connect_db() as con:
-        cursor = con.execute("UPDATE emergency_alerts SET status=? WHERE id=? AND status='Queued for LoRa'", (next_status, alert_id))
+        cursor = con.execute("UPDATE emergency_alerts SET status=?, sent_at=CASE WHEN ? THEN COALESCE(sent_at, ?) ELSE sent_at END WHERE id=? AND status='Queued for LoRa'",
+                             (next_status, sent, now_iso(), alert_id))
     if cursor.rowcount == 0:
         return jsonify(error="Queued SOS not found."), 404
     return jsonify(ok=True, status=next_status)
@@ -583,8 +631,54 @@ def mobile_alerts():
     if session.get("role") not in {"staff", "owner"}:
         return jsonify(error="Sign in with a staff or owner account on the phone."), 401
     with connect_db() as con:
-        rows = con.execute("SELECT id,alert_type,details,status,created_at,resolved_at,latitude,longitude,gps_accuracy_m,is_demo FROM emergency_alerts ORDER BY created_at DESC LIMIT 100").fetchall()
+        rows = con.execute("SELECT id,alert_type,details,status,created_at,sent_at,resolved_at,latitude,longitude,gps_accuracy_m,responder_username,responder_role,responded_at,resolved_by,resolved_role,responder_latitude,responder_longitude,responder_accuracy_m,responder_location_at,responder_source,responder_message,responder_message_at,camper_reply_message,camper_reply_at,is_demo FROM emergency_alerts ORDER BY created_at DESC").fetchall()
     return jsonify(alerts=[dict(row) for row in rows])
+
+
+@app.post("/api/mobile/alerts/<alert_id>/respond")
+def respond_mobile_alert(alert_id):
+    if session.get("role") not in {"staff", "owner"}:
+        return jsonify(error="Sign in with a staff or owner account on the phone."), 401
+    payload = request.get_json(silent=True) or {}
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip() or len(message) > 100:
+        return jsonify(error="Enter a response message of 1 to 100 characters."), 400
+    message = message.strip()
+    now = now_iso()
+    with connect_db() as con:
+        cursor = con.execute("UPDATE emergency_alerts SET status='Responder en route', responded_at=COALESCE(responded_at, ?), responder_username=?, responder_role=?, responder_source='Phone app', responder_message=?, responder_message_at=? WHERE id=? AND status!='Resolved' AND responder_message IS NULL",
+                             (now, session.get("username"), session.get("role"), message, now, alert_id))
+    if cursor.rowcount == 0:
+        with connect_db() as con:
+            existing = con.execute("SELECT status,responder_message FROM emergency_alerts WHERE id=?", (alert_id,)).fetchone()
+        if not existing:
+            return jsonify(error="Emergency alert not found."), 404
+        reason = "This SOS is already resolved." if existing["status"] == "Resolved" else "A response message has already been sent for this SOS."
+        return jsonify(error=reason), 409
+    return jsonify(ok=True, status="Responder en route", responded_at=now,
+                   responder_username=session.get("username"), responder_role=session.get("role"),
+                   responder_message=message, responder_message_at=now)
+
+
+@app.post("/api/camper/alerts/<alert_id>/reply")
+def reply_to_responder(alert_id):
+    payload = request.get_json(silent=True) or {}
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip() or len(message) > 100:
+        return jsonify(error="Enter a reply of 1 to 100 characters."), 400
+    message = message.strip()
+    now = now_iso()
+    with connect_db() as con:
+        cursor = con.execute("UPDATE emergency_alerts SET camper_reply_message=?, camper_reply_at=? WHERE id=? AND status!='Resolved' AND responder_message IS NOT NULL AND camper_reply_message IS NULL",
+                             (message, now, alert_id))
+    if cursor.rowcount == 0:
+        with connect_db() as con:
+            existing = con.execute("SELECT status,responder_message,camper_reply_message FROM emergency_alerts WHERE id=?", (alert_id,)).fetchone()
+        if not existing:
+            return jsonify(error="Emergency alert not found."), 404
+        reason = "This SOS is already resolved." if existing["status"] == "Resolved" else "A reply is not available or has already been sent for this SOS."
+        return jsonify(error=reason), 409
+    return jsonify(ok=True, camper_reply_message=message, camper_reply_at=now)
 
 
 @app.post("/api/mobile/alerts/<alert_id>/resolve")
@@ -593,7 +687,8 @@ def resolve_mobile_alert(alert_id):
         return jsonify(error="Sign in with a staff or owner account on the phone."), 401
     now = now_iso()
     with connect_db() as con:
-        cursor = con.execute("UPDATE emergency_alerts SET status='Resolved', resolved_at=? WHERE id=?", (now, alert_id))
+        cursor = con.execute("UPDATE emergency_alerts SET status='Resolved', resolved_at=?, responded_at=COALESCE(responded_at, ?), responder_username=COALESCE(responder_username, ?), responder_role=COALESCE(responder_role, ?), responder_source=COALESCE(responder_source, 'Phone app'), resolved_by=?, resolved_role=? WHERE id=?",
+                             (now, now, session.get("username"), session.get("role"), session.get("username"), session.get("role"), alert_id))
     if cursor.rowcount == 0:
         return jsonify(error="Emergency alert not found."), 404
     return jsonify(ok=True)
@@ -629,14 +724,43 @@ def update_hardware_telemetry():
                                  or not math.isfinite(accuracy) or accuracy < 0):
         return jsonify(error="GPS accuracy must be a non-negative number of meters."), 400
     responder_lat, responder_lon = payload.get("responder_latitude"), payload.get("responder_longitude")
-    responder_fields_present = "responder_latitude" in payload or "responder_longitude" in payload
-    if responder_fields_present and (
+    responder_location_present = "responder_latitude" in payload or "responder_longitude" in payload
+    if responder_location_present and (
         not isinstance(responder_lat, (int, float)) or isinstance(responder_lat, bool)
         or not isinstance(responder_lon, (int, float)) or isinstance(responder_lon, bool)
         or not math.isfinite(responder_lat) or not math.isfinite(responder_lon)
         or not -90 <= responder_lat <= 90 or not -180 <= responder_lon <= 180
     ):
         return jsonify(error="Rescuer location requires valid latitude and longitude coordinates."), 400
+    responder_accuracy = payload.get("responder_accuracy_m")
+    if responder_accuracy is not None and (
+        not isinstance(responder_accuracy, (int, float)) or isinstance(responder_accuracy, bool)
+        or not math.isfinite(responder_accuracy) or responder_accuracy < 0
+    ):
+        return jsonify(error="Responder GPS accuracy must be a non-negative number of meters."), 400
+    responder_identity_present = "responder_username" in payload or "responder_role" in payload
+    responder_username = payload.get("responder_username")
+    if responder_username is not None and not isinstance(responder_username, str):
+        return jsonify(error="Responder name must be text."), 400
+    responder_username = responder_username.strip()[:80] or None if isinstance(responder_username, str) else None
+    responder_role = payload.get("responder_role")
+    if responder_role is not None and (not isinstance(responder_role, str) or responder_role not in {"staff", "owner"}):
+        return jsonify(error="Responder role must be staff or owner."), 400
+    responder_message = payload.get("responder_message")
+    if responder_message is not None and not isinstance(responder_message, str):
+        return jsonify(error="Responder message must be text."), 400
+    if isinstance(responder_message, str) and len(responder_message) > 100:
+        return jsonify(error="Responder message must be 100 characters or fewer."), 400
+    responder_message = responder_message.strip() or None if isinstance(responder_message, str) else None
+    responder_alert_id = (str(payload.get("responder_alert_id", ""))[:80] or None
+                          if "responder_alert_id" in payload else current.get("responder_alert_id"))
+    same_responder_alert = responder_alert_id is not None and responder_alert_id == current.get("responder_alert_id")
+    saved_responder_lat = float(responder_lat) if responder_location_present else current.get("responder_latitude") if same_responder_alert else None
+    saved_responder_lon = float(responder_lon) if responder_location_present else current.get("responder_longitude") if same_responder_alert else None
+    saved_responder_accuracy = float(responder_accuracy) if responder_accuracy is not None else current.get("responder_accuracy_m") if same_responder_alert else None
+    saved_responder_username = responder_username if "responder_username" in payload else current.get("responder_username") if same_responder_alert else None
+    saved_responder_role = responder_role if "responder_role" in payload else current.get("responder_role") if same_responder_alert else None
+    saved_responder_message = responder_message if "responder_message" in payload else current.get("responder_message") if same_responder_alert else None
     app.config["HARDWARE_STATUS"] = {
         "battery_detected": detected,
         "battery_percent": round(float(percent)) if detected else None,
@@ -648,11 +772,20 @@ def update_hardware_telemetry():
         "longitude": float(longitude) if gps_fix else None if gps_fields_present else current.get("longitude"),
         "gps_accuracy_m": float(accuracy) if gps_fix and accuracy is not None else None if gps_fields_present else current.get("gps_accuracy_m"),
         "gps_updated_at": now_iso() if gps_fields_present else current.get("gps_updated_at"),
-        "responder_latitude": float(responder_lat) if responder_fields_present else current.get("responder_latitude"),
-        "responder_longitude": float(responder_lon) if responder_fields_present else current.get("responder_longitude"),
-        "responder_updated_at": now_iso() if responder_fields_present else current.get("responder_updated_at"),
-        "responder_alert_id": str(payload.get("responder_alert_id", ""))[:80] or None if responder_fields_present else current.get("responder_alert_id"),
+        "responder_latitude": saved_responder_lat,
+        "responder_longitude": saved_responder_lon,
+        "responder_accuracy_m": saved_responder_accuracy,
+        "responder_username": saved_responder_username,
+        "responder_role": saved_responder_role,
+        "responder_message": saved_responder_message,
+        "responder_updated_at": now_iso() if responder_location_present else current.get("responder_updated_at") if same_responder_alert else None,
+        "responder_alert_id": responder_alert_id,
     }
+    if (responder_location_present or responder_identity_present or responder_message is not None) and responder_alert_id:
+        with connect_db() as con:
+            message_at = now_iso()
+            con.execute("UPDATE emergency_alerts SET responder_username=COALESCE(?,responder_username), responder_role=COALESCE(?,responder_role), responded_at=COALESCE(responded_at,?), responder_latitude=COALESCE(?,responder_latitude), responder_longitude=COALESCE(?,responder_longitude), responder_accuracy_m=COALESCE(?,responder_accuracy_m), responder_location_at=COALESCE(?,responder_location_at), responder_message=COALESCE(?,responder_message), responder_message_at=CASE WHEN ? IS NOT NULL THEN COALESCE(responder_message_at,?) ELSE responder_message_at END, responder_source='LoRa', status=CASE WHEN status='Resolved' THEN status ELSE 'Responder en route' END WHERE id=?",
+                        (saved_responder_username, saved_responder_role, message_at, saved_responder_lat, saved_responder_lon, saved_responder_accuracy, message_at if responder_location_present else None, saved_responder_message, saved_responder_message, message_at, responder_alert_id))
     return jsonify(ok=True)
 
 
@@ -1174,6 +1307,24 @@ def owner_sessions():
         energy = con.execute("SELECT COALESCE(SUM(energy_kwh),0) FROM camper_sessions WHERE status IN ('Completed','Recovered') AND ended_at >= ? AND ended_at < ?", (start, end)).fetchone()[0]
     revenue = sum(row["paid"] for row in rows)
     return jsonify(sessions=rows, revenue=revenue, count=len(rows), average=(revenue / len(rows) if rows else 0), energy_kwh=energy)
+
+
+@app.get("/api/owner/mobile-revenue")
+@require_role("owner")
+def owner_mobile_revenue():
+    if session.get("role") != "owner" or not app.config["DEMO_ACTIVE"]:
+        return jsonify(available=False, revenue_php=None)
+    today = datetime.now().astimezone().date()
+    revenue = 0
+    for record in app.config["DEMO_SESSIONS"]:
+        created = record.get("created_at")
+        try:
+            created_day = datetime.fromisoformat(created).astimezone().date()
+        except (TypeError, ValueError):
+            continue
+        if created_day == today:
+            revenue += int(record.get("paid", 0) or 0)
+    return jsonify(available=True, revenue_php=revenue)
 
 
 @app.get("/api/owner/staff")
