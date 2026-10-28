@@ -45,7 +45,8 @@ The sign-in page includes an on-screen keyboard with letters, digits, symbols, s
 - In `phone campconnect/app.js`, search for `TODO(BLE_POINT_B_SETUP)`. The phone can request a Bluetooth LE connection and remember/reconnect to a previously approved device. Until the ESP32 Point B firmware is available, the status intentionally says **setup pending** and dashboard/SOS data continues over the kiosk's local network.
 - When the ESP32 firmware is ready, fill in `POINT_B_DEVICE_NAME_PREFIX`, `POINT_B_SERVICE_UUID`, `POINT_B_TX_CHARACTERISTIC_UUID`, and `POINT_B_RX_CHARACTERISTIC_UUID` there, then implement the documented message framing for read/write/notifications. Only report LoRa as connected after the BLE service confirms the Point B LoRa link, not just after GATT connects.
 - Web Bluetooth requires a user tap to pair, a supported browser, and a secure page (HTTPS on a phone; localhost is treated specially for development). The current plain-HTTP local-network address will use the kiosk Wi-Fi/Ethernet fallback. For a native Android APK, implement the same transport with Android Bluetooth permissions and BLE APIs.
-- 
+
+  
 ## Page files and what they are and if ever you have to change something there's comment for each of their function.
 
 - `camper.html`, `camper.css`, `camper.js` — camper locker, PIN, charging, and SOS screens.
