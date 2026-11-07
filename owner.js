@@ -4,7 +4,7 @@ let demoViewInitialized = false;
 let demoCostOverrides = {};
 let demoSnapshot = { reportSessions: [], feedback: [], recoveryAudit: [] };
 let demoLiveEnergy = null;
-let liveOwnerData = { sessions: [], revenue: 0, count: 0, average: 0, energy_kwh: 0 };
+let liveOwnerData = { sessions: [], revenue: 0, count: 0, financial_count: 0, average: 0, energy_kwh: 0, energy_series: [] };
 let communicationMode = 'lora';
 const demoFinancials = {
   'Today': { revenue: 250, costs: 50, sessions: 2 },
@@ -83,9 +83,18 @@ function renderFinancialChart(revenue, costs, result, period) {
 function renderEnergyChart(period) {
   const days = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
   const size = period === 'Today' ? 24 : period === 'This week' ? 7 : days;
-  const readings = demoActive
-    ? demoLiveEnergy == null ? demoEnergy[period] : (() => { const live = Array(size).fill(0); live[period === 'Today' ? new Date().getHours() : period === 'This week' ? (new Date().getDay() + 6) % 7 : new Date().getDate() - 1] = Number(demoLiveEnergy); return live; })()
-    : Array(size).fill(0);
+  const readings = demoActive ? [...demoEnergy[period]] : Array.isArray(liveOwnerData.energy_series) && liveOwnerData.energy_series.length === size
+    ? [...liveOwnerData.energy_series] : Array(size).fill(0);
+  if (demoActive) {
+    for (const row of demoSnapshot.reportSessions || []) {
+      if (row.demo_sample || !['Completed', 'Recovered'].includes(row.status) || row.energy == null) continue;
+      const stamp = row.returned_at || row.created_at;
+      const when = stamp ? new Date(stamp) : null;
+      if (!when || Number.isNaN(when.getTime())) continue;
+      const bucket = period === 'Today' ? when.getHours() : period === 'This week' ? (when.getDay() + 6) % 7 : when.getDate() - 1;
+      if (bucket >= 0 && bucket < readings.length) readings[bucket] += Number(row.energy) || 0;
+    }
+  }
   const names = period === 'Today' ? readings.map((_, h) => fmtHour(h)) : period === 'This week' ? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] : readings.map((_, d) => String(d + 1));
   const full = period === 'Today' ? names : period === 'This week' ? names : names.map(n => `Day ${n}`);
   const total = readings.reduce((s, v) => s + v, 0), peak = Math.max(0, ...readings), avg = total / readings.length;
@@ -107,8 +116,8 @@ function renderEnergyChart(period) {
   $('#energyPeriodNote').textContent = `${period} · ${period === 'Today' ? 'hour by hour' : 'day by day'} · kilowatt-hours (kWh)`;
   $('#energyTotal').textContent = `${total.toFixed(2)} kWh total`;
   $('#energyCaption').textContent = demoActive
-    ? demoLiveEnergy != null ? 'Live energy meter reading reported by the connected hardware.' : 'Sample demo energy readings are temporary; new sessions show meter data when a meter is connected.'
-    : 'No energy meter readings yet. Connect an energy meter to record camper charging consumption.';
+    ? 'Sample demo readings plus measured energy from completed demo sessions. New meter readings appear after a camper session ends.'
+    : liveOwnerData.energy_kwh > 0 ? 'Meter readings saved for completed camper sessions on this kiosk.' : 'No completed camper energy readings yet. A connected meter records usage when a session ends.';
 }
 function renderFinancials() {
   const period = $('#period').value;
@@ -118,15 +127,15 @@ function renderFinancials() {
   const costs = demoActive ? (demoCostOverrides[period] ?? demo.costs) : savedCost(period);
   const result = revenue - costs;
   $('#revenue').textContent = peso(revenue);
-  $('#revenueNote').textContent = demoActive ? 'Temporary demo values · not saved' : liveOwnerData.count ? 'Completed paid sessions stored on this kiosk' : 'No completed payment records yet';
+  $('#revenueNote').textContent = demoActive ? 'Temporary demo values · not saved' : liveOwnerData.financial_count ? 'Payments from active and completed sessions stored on this kiosk' : 'No payment records yet';
   $('#costs').textContent = peso(costs);
   $('#costCardNote').textContent = demoActive ? 'Temporary demo estimate' : 'Owner-entered estimate';
   $('#profit').textContent = peso(result);
   const sessionCount = demo.sessions + createdDemoRows.length;
-  $('#sessionCount').textContent = demoActive ? String(sessionCount) : String(liveOwnerData.count);
+  $('#sessionCount').textContent = demoActive ? String(sessionCount) : String(liveOwnerData.financial_count ?? liveOwnerData.count);
   $('#averagePayment').textContent = demoActive ? peso(sessionCount ? revenue / sessionCount : 0) : peso(liveOwnerData.average);
   $('#refunds').textContent = '₱0';
-  $('#financialNote').textContent = demoActive ? 'Temporary simulated figures for the selected period; not stored.' : 'Completed camper sessions and payments are read from the kiosk database.';
+  $('#financialNote').textContent = demoActive ? 'Temporary simulated figures plus payments collected during this demo.' : 'Collected payments include active and completed sessions stored on this kiosk.';
   $('#costNote').textContent = demoActive ? 'Demo cost changes disappear when demo mode stops.' : 'This estimate is saved in this browser for the selected period.';
   $('#costInput').value = costs;
   $('#chartMode').textContent = demoActive ? 'DEMO DATA' : 'LIVE DATA';
@@ -158,15 +167,17 @@ function renderDemo(active, snapshot = null) {
   if (changed && !nextActive) { demoCostOverrides = {}; demoSnapshot = { reportSessions: [], feedback: [], recoveryAudit: [] }; demoLiveEnergy = null; }
   demoActive = nextActive;
   demoViewInitialized = true;
+  $('#sessions .panel-head h2').textContent = demoActive ? 'Demo camper records' : 'Completed sessions';
+  $('#sessions thead th:last-child').textContent = demoActive ? 'STATUS / RETURNED' : 'RETURNED';
   $('#demoToggle').textContent = demoActive ? 'Stop demo' : 'Start demo';
   $('#demoToggle').classList.toggle('demo-running', demoActive);
   $('#demoNotice').hidden = !demoActive;
   $('#staffDemoLink').hidden = !demoActive;
   const rows = demoActive ? demoRowsForPeriod($('#period').value) : [];
   $('#ownerRows').innerHTML = rows.length
-    ? rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.locker)}</td><td>${peso(row.paid)}</td><td>${esc(row.minutes ?? '—')} min</td><td>${esc(row.used)}</td><td>${row.energy == null ? 'Meter needed' : `${Number(row.energy).toFixed(3)} kWh`}</td><td>${esc(row.returned || '—')}</td></tr>`).join('')
-    : '<tr><td colspan="7" class="muted-cell">No completed sessions in this period.</td></tr>';
-  $('#sessionEmptyNote').textContent = demoActive ? 'Temporary demonstration rows · not saved' : 'No completed sessions recorded.';
+    ? rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.locker)}</td><td>${peso(row.paid)}</td><td>${esc(row.minutes ?? '—')} min</td><td>${esc(row.used)}</td><td>${row.energy == null ? 'Meter needed' : `${Number(row.energy).toFixed(3)} kWh`}</td><td>${esc(row.returned || (row.demo_sample ? '—' : row.status || 'In progress'))}</td></tr>`).join('')
+    : '<tr><td colspan="7" class="muted-cell">No demo records in this period.</td></tr>';
+  $('#sessionEmptyNote').textContent = demoActive ? 'Ten sample rows plus camper activity created during this demo · temporary' : 'No completed sessions recorded.';
   renderFinancials();
 }
 function renderConnectivity(mode, status = {}) {
@@ -452,6 +463,21 @@ $('#exportFeedback').addEventListener('click', () => {
 $('#logout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/camper.html';
+});
+$('#closeKiosk').addEventListener('click', async () => {
+  if (!confirm('Close the kiosk display? CampConnect will keep running on the Raspberry Pi.')) return;
+  const button = $('#closeKiosk');
+  button.disabled = true;
+  button.textContent = 'Closing…';
+  try {
+    const response = await fetch('/api/kiosk/close', { method: 'POST' });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw Error(result.error || 'Could not close the kiosk display.');
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Exit kiosk';
+    toast(error.message);
+  }
 });
 api('/api/me').then(user => { $('#ownerName').textContent = user.username; }).catch(() => { location.href = '/login'; });
 loadConnectivity().catch(error => toast(error.message));
