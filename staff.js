@@ -183,6 +183,25 @@ $('#exportAudit').addEventListener('click', async () => {
   finally { button.disabled = false; }
 });
 
+$('#exportCamperRecords').addEventListener('click', async () => {
+  const button = $('#exportCamperRecords');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/staff/sessions/export', { method: 'POST' });
+    const result = response.ok ? null : await response.json().catch(() => ({}));
+    if (!response.ok) throw Error(result?.error || 'Could not export camper records.');
+    const blob = await response.blob();
+    const name = response.headers.get('Content-Disposition')?.match(/filename="?([^";]+)"?/i)?.[1] || 'camper-records.csv';
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = name;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    toast(demoActive ? 'Demo camper records saved on the kiosk and downloaded.' : 'Camper records saved on the kiosk and downloaded.');
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
+});
+
 fetch('/api/me').then(response => { if (!response.ok) throw new Error(); return response.json(); })
   .then(user => {
     viewerRole = user.role;
@@ -204,4 +223,19 @@ fetch('/api/me').then(response => { if (!response.ok) throw new Error(); return 
 $('#staffLogout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/camper.html';
+});
+$('#closeKiosk').addEventListener('click', async () => {
+  if (!confirm('Close the kiosk display? CampConnect will keep running on the Raspberry Pi.')) return;
+  const button = $('#closeKiosk');
+  button.disabled = true;
+  button.textContent = 'Closing…';
+  try {
+    const response = await fetch('/api/kiosk/close', { method: 'POST' });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw Error(result.error || 'Could not close the kiosk display.');
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Exit kiosk';
+    toast(error.message);
+  }
 });
