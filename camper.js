@@ -1,12 +1,16 @@
 const $ = selector => document.querySelector(selector);
 let demoMode = false;
 let viewerRole = null;
-let locker = null, session = null, pin = '', firstPin = '', pinStep = 'create';
-let pickupPin = '', coins = 0, expiry = 0, chargeTimer = null, paymentTimer = null, paymentSeconds = 15;
+let locker = null, session = null, pickupTarget = null, pin = '', firstPin = '', pinStep = 'create';
+let pickupPin = '', coins = 0, chargeTimer = null, paymentTimer = null, paymentSeconds = 15;
+const chargeTimers = new Map();
+const lockerSessions = new Map();
 let toastTimer;
 let currentKioskLocation = null, currentTransport = null;
 let feedbackRating = 0, feedbackContext = { sessionId: null, demoRecordId: null, locker: null }, feedbackShift = false;
-let doorPollTimer = null;
+const doorPollTimers = new Map();
+let demoSyncInFlight = false;
+let lockerStateHydrated = false;
 let responderPopupKey = null, responderPopupTimer = null, camperReplyAlertId = null, camperReplyShift = false;
 const demoSessionStorageKey = 'campconnect-active-demo-session';
 
@@ -125,8 +129,11 @@ async function refreshTransportStatus() {
   } catch (_) { /* Keep the last shown connection status if the local service is briefly unavailable. */ }
 }
 async function syncDemoState() {
+  if (demoSyncInFlight) return;
+  demoSyncInFlight = true;
   if (viewerRole !== 'owner') {
     demoMode = false;
+    demoSyncInFlight = false;
     return;
   }
   try {
@@ -135,6 +142,17 @@ async function syncDemoState() {
     const { active } = await response.json();
     if (demoMode && !active) {
       resetSession(false);
+      for (const [id, record] of lockerSessions) {
+        if (!record.demo) continue;
+        const timerKey = record.demoRecordId;
+        clearInterval(chargeTimers.get(timerKey));
+        chargeTimers.delete(timerKey);
+        clearInterval(doorPollTimers.get(timerKey));
+        doorPollTimers.delete(timerKey);
+        setLockerAvailable(id);
+        lockerSessions.delete(id);
+      }
+      sessionStorage.removeItem(demoSessionStorageKey);
       locker = null;
       toast('Owner demo ended. The kiosk returned to normal mode.');
     }
@@ -142,18 +160,17 @@ async function syncDemoState() {
     $('#systemDemoBanner').hidden = !demoMode;
     $('#demoCoinButtons').hidden = !demoMode;
     $('#coinHardwareStatus').textContent = demoMode ? 'Owner demo: simulated coin input' : 'Coin slot not connected';
-    if (demoMode && !session) {
+    if (demoMode) {
       const result = await demoApi('/api/owner/demo/sessions');
       await restoreDemoSession(result.sessions);
+    } else {
+      await syncNormalLockerSessions();
     }
     if (demoMode && session?.demoRecordId) {
       const result = await demoApi('/api/owner/demo/sessions');
       const record = result.sessions.find(item => item.id === session.demoRecordId);
       if (record?.status === 'Awaiting pickup' && session.status === 'charging') {
-        clearInterval(chargeTimer);
-        chargeTimer = null;
-        session.status = 'pickup';
-        renderLockerState('pickup');
+        stopCharging(session);
         toast('Demo staff ended charging. The locker is waiting for pickup.');
       } else if (record?.status === 'Recovered' && session.status === 'pickup') {
         await openLockerDoor('pickup');
@@ -162,6 +179,7 @@ async function syncDemoState() {
     }
     if (session?.status === 'charging') renderLockerState('charging');
   } catch (_) { /* Keep the regular kiosk view if the service is temporarily unavailable. */ }
+  finally { demoSyncInFlight = false; }
 }
 async function demoApi(path, method = 'GET', payload = null) {
   const response = await fetch(path, {
@@ -175,44 +193,202 @@ async function demoApi(path, method = 'GET', payload = null) {
   return result;
 }
 async function restoreDemoSession(records) {
+  const pendingReservation = $('#nameDialog').open && !session;
+  const pendingLocker = locker;
+  const pickupDialogSession = $('#pickupDialog').open ? (pickupTarget || session) : null;
   const unfinished = (records || []).filter(record => record.status !== 'Completed');
-  if (!unfinished.length) {
-    sessionStorage.removeItem(demoSessionStorageKey);
-    return;
+  const activeDemoIds = new Set(unfinished.map(record => record.id));
+  for (const [lockerId, prior] of lockerSessions) {
+    if (!prior.demo || activeDemoIds.has(prior.demoRecordId)) continue;
+    clearInterval(chargeTimers.get(prior.demoRecordId));
+    chargeTimers.delete(prior.demoRecordId);
+    clearInterval(doorPollTimers.get(prior.demoRecordId));
+    doorPollTimers.delete(prior.demoRecordId);
+    setLockerAvailable(lockerId);
+    lockerSessions.delete(lockerId);
+    if (session === prior) session = null;
   }
   const preferredId = sessionStorage.getItem(demoSessionStorageKey);
-  const record = unfinished.find(item => item.id === preferredId)
-    || [...unfinished].reverse().find(item => ['Charging', 'Awaiting pickup', 'Recovered', 'Locker open', 'Loading gear'].includes(item.status))
-    || unfinished[unfinished.length - 1];
-  locker = record.locker;
+  let selected = null;
   const states = {
     'Waiting for payment': 'payment', 'Payment received': 'payment', 'Loading gear': 'loading-door',
-    Charging: 'charging', 'Awaiting pickup': 'pickup', Recovered: 'pickup', 'Locker open': 'door'
+    'PIN setup': 'pin-setup', Charging: 'charging', 'Awaiting pickup': 'pickup', Recovered: 'pickup', 'Locker open': 'door'
   };
-  session = { ...record, demo: true, demoRecordId: record.id, pin: '', status: states[record.status] || 'payment' };
-  sessionStorage.setItem(demoSessionStorageKey, record.id);
-  coins = Number(record.paid) || 0;
-  if (record.status === 'Charging') startCharging(true);
-  else if (record.status === 'Awaiting pickup') renderLockerState('pickup');
-  else if (record.status === 'Recovered') await openLockerDoor('pickup');
-  else if (record.status === 'Locker open' || record.status === 'Loading gear') renderLockerState('door');
-  else {
-    $('#coinTotal').textContent = `₱${coins}`;
-    updatePayment();
-    open('paymentDialog');
+  for (const record of unfinished) {
+    const existing = lockerSessions.get(String(record.locker));
+    const keepLocalPinStep = existing?.status === 'pin-setup' && ['Waiting for payment', 'Payment received'].includes(record.status);
+    const target = existing?.demoRecordId === record.id
+      ? Object.assign(existing, record, keepLocalPinStep ? { status: 'PIN setup' } : {})
+      : { ...record, demo: true, demoRecordId: record.id, pin: '', status: states[record.status] || 'payment' };
+    target.status = record.status === 'Recovered' && target.recoveryOpening
+      ? 'door'
+      : states[record.status] || target.status;
+    lockerSessions.set(String(record.locker), target);
+    if (record.status !== 'Charging' && chargeTimers.has(target.demoRecordId)) {
+      clearInterval(chargeTimers.get(target.demoRecordId));
+      chargeTimers.delete(target.demoRecordId);
+    }
+    const priorSession = session, priorLocker = locker, priorCoins = coins;
+    session = target;
+    locker = record.locker;
+    coins = Number(record.paid) || 0;
+    if (record.status === 'Charging') {
+      const key = target.demoRecordId;
+      if (!chargeTimers.has(key)) await startCharging(true);
+      else renderLockerState('charging');
+    } else if (record.status === 'Awaiting pickup') renderLockerState('pickup');
+    else if (record.status === 'Recovered' && !target.recoveryOpening) {
+      target.recoveryOpening = true;
+      await openLockerDoor('pickup');
+    }
+    else if (record.status === 'Locker open' || record.status === 'Loading gear') renderLockerState('door');
+    if (record.id === preferredId || (!selected && ['Waiting for payment', 'Payment received', 'PIN setup', 'Charging', 'Awaiting pickup', 'Recovered', 'Loading gear', 'Locker open'].includes(record.status))) selected = target;
+    session = priorSession;
+    locker = priorLocker;
+    coins = priorCoins;
   }
+  if (pendingReservation) {
+    // Keep the newly chosen locker while refreshing other occupied lockers.
+    // The name form can stay open for several polls before the POST is sent.
+    session = null;
+    locker = pendingLocker;
+  } else if (pickupDialogSession && unfinished.some(item => item.id === pickupDialogSession.demoRecordId)) {
+    session = pickupDialogSession;
+    locker = pickupDialogSession.locker;
+    coins = Number(pickupDialogSession.paid) || 0;
+  } else if (selected) {
+    session = selected;
+    locker = selected.locker;
+    coins = Number(selected.paid) || 0;
+    sessionStorage.setItem(demoSessionStorageKey, selected.demoRecordId);
+    if (['payment'].includes(selected.status)) {
+      $('#coinTotal').textContent = `₱${coins}`;
+      updatePayment();
+      if (!$('#paymentDialog').open) open('paymentDialog');
+    } else if (selected.status === 'pin-setup') {
+      restorePinSetupDialog();
+    }
+  } else if (!session?.demoRecordId || !unfinished.some(item => item.id === session.demoRecordId)) {
+    session = null;
+    if (!unfinished.length) sessionStorage.removeItem(demoSessionStorageKey);
+  }
+  finishLockerHydration();
 }
-function saveDemoSession(updates) {
-  if (viewerRole !== 'owner' || !demoMode || !session?.demoRecordId) return;
-  return demoApi(`/api/owner/demo/sessions/${encodeURIComponent(session.demoRecordId)}`, 'PATCH', updates).catch(() => {});
+async function syncNormalLockerSessions() {
+  try {
+    const response = await fetch('/api/camper/active-sessions', { cache: 'no-store' });
+    if (!response.ok) return;
+    const data = await response.json();
+    if (data.demo_active) {
+      // Owner demo state has a single poller (syncDemoState). Avoid applying
+      // overlapping snapshots that can temporarily redraw a locker as free.
+      if (viewerRole === 'owner') return;
+      demoMode = true;
+      $('#systemDemoBanner').hidden = false;
+      $('#demoCoinButtons').hidden = !(viewerRole === 'owner');
+      $('#coinHardwareStatus').textContent = 'Owner demo: simulated coin input';
+      await restoreDemoSession(data.sessions || []);
+      const demoLockers = new Set((data.sessions || []).filter(record => record.status !== 'Completed').map(record => String(record.locker)));
+      for (const reserved of data.reserved_lockers || []) {
+        const lockerId = String(reserved);
+        if (demoLockers.has(lockerId)) continue;
+        const card = document.querySelector(`[data-locker="${lockerId}"]`);
+        if (card) {
+          card.className = 'locker busy';
+          card.removeAttribute('role');
+          card.removeAttribute('tabindex');
+          card.innerHTML = `<div class="card-head"><b>LOCKER ${lockerId}</b><span class="badge busy-badge">IN USE</span></div><div class="locker-icon">▣</div><h3>Locker reserved</h3><p>There is an active main-system session</p><small>DEMO USES ANOTHER LOCKER</small>`;
+        }
+      }
+      finishLockerHydration();
+      return;
+    }
+    const pendingReservation = $('#nameDialog').open && !session;
+    const pendingLocker = locker;
+    const sessions = data.sessions || [];
+    const activeNormalIds = new Set(sessions.map(record => record.id));
+    for (const [lockerId, prior] of lockerSessions) {
+      if (prior.demo || activeNormalIds.has(prior.storageId)) continue;
+      clearInterval(chargeTimers.get(prior.storageId));
+      chargeTimers.delete(prior.storageId);
+      clearInterval(doorPollTimers.get(prior.storageId));
+      doorPollTimers.delete(prior.storageId);
+      setLockerAvailable(lockerId);
+      lockerSessions.delete(lockerId);
+      if (session === prior) session = null;
+    }
+    const states = { 'Waiting for payment': 'payment', 'Payment received': 'payment', 'PIN setup': 'pin-setup', 'Loading gear': 'loading-door', 'Locker open': 'door', Charging: 'charging', 'Awaiting pickup': 'pickup' };
+    let preferred = null;
+    for (const record of sessions) {
+      const existing = lockerSessions.get(String(record.locker));
+      const keepLocalPinStep = existing?.status === 'pin-setup' && ['Waiting for payment', 'Payment received'].includes(record.status);
+      const target = existing?.storageId === record.id
+        ? Object.assign(existing, record, keepLocalPinStep ? { status: 'PIN setup' } : {})
+        : { ...record, storageId: record.id, demo: false, pin: '', status: states[record.status] || 'payment' };
+      target.storageId = record.id;
+      target.status = states[record.status] || target.status;
+      lockerSessions.set(String(record.locker), target);
+      if (record.status !== 'Charging' && chargeTimers.has(record.id)) {
+        clearInterval(chargeTimers.get(record.id));
+        chargeTimers.delete(record.id);
+      }
+      const priorSession = session, priorLocker = locker, priorCoins = coins;
+      session = target;
+      locker = record.locker;
+      coins = Number(record.paid) || 0;
+      if (record.status === 'Charging') {
+        if (!chargeTimers.has(record.id)) await startCharging(true);
+        else renderLockerState('charging');
+      } else if (record.status === 'Awaiting pickup') renderLockerState('pickup');
+      else if (record.status === 'Loading gear' || record.status === 'Locker open') renderLockerState('door');
+      else if (record.status === 'PIN setup') renderLockerState('payment');
+      else renderLockerState('payment');
+      if (record.id === sessionStorage.getItem('campconnect-active-session')) preferred = target;
+      session = priorSession;
+      locker = priorLocker;
+      coins = priorCoins;
+    }
+    if (pendingReservation) {
+      session = null;
+      locker = pendingLocker;
+    } else if (!session && preferred) {
+      session = preferred;
+      locker = preferred.locker;
+      coins = Number(preferred.paid) || 0;
+      if (preferred.status === 'payment') {
+        $('#coinTotal').textContent = `₱${coins}`;
+        updatePayment();
+        open('paymentDialog');
+      } else if (preferred.status === 'pin-setup') {
+        restorePinSetupDialog();
+      }
+    }
+    finishLockerHydration();
+  } catch (_) { /* Leave locker cards as they are while the kiosk service reconnects. */ }
 }
-function savePersistentSession(updates) {
-  if (!session?.storageId || session.demo) return Promise.resolve(null);
-  const pending = fetch(`/api/sessions/${encodeURIComponent(session.storageId)}`, {
+function saveDemoSession(updates, target = session) {
+  if (viewerRole !== 'owner' || !demoMode || !target?.demoRecordId) return;
+  return demoApi(`/api/owner/demo/sessions/${encodeURIComponent(target.demoRecordId)}`, 'PATCH', updates).catch(() => {});
+}
+function savePersistentSession(updates, target = session) {
+  if (!target?.storageId || target.demo) return Promise.resolve(null);
+  const pending = fetch(`/api/sessions/${encodeURIComponent(target.storageId)}`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates)
   });
   pending.catch(() => {});
   return pending;
+}
+function restorePinSetupDialog() {
+  if ($('#pinDialog').open) return;
+  pin = firstPin = '';
+  pinStep = 'create';
+  $('#pinError').textContent = '';
+  $('#pinTitle').textContent = 'Create your 6-digit PIN';
+  $('#pinText').textContent = 'You will need this PIN to open the locker after charging finishes.';
+  drawDots('pinDots', '');
+  $('#pinNext').disabled = true;
+  if ($('#paymentDialog').open) $('#paymentDialog').close();
+  open('pinDialog');
 }
 function open(id) { document.getElementById(id).showModal(); }
 function drawDots(hostId, value) {
@@ -294,31 +470,61 @@ function updateAvailableCount() {
   const count = document.querySelectorAll('.locker.available').length;
   $('#availableCount').textContent = `${count} locker${count === 1 ? '' : 's'} available`;
 }
+function finishLockerHydration() {
+  if (lockerStateHydrated) return;
+  lockerStateHydrated = true;
+  $('#lockerGrid').inert = false;
+  $('#lockerStatusNote').textContent = 'Tap an available locker to begin.';
+  updateAvailableCount();
+}
+async function recoverOccupiedLockerSelection(message) {
+  $('#nameDialog').close();
+  $('#camperName').value = '';
+  $('#nameError').textContent = '';
+  locker = null;
+  session = null;
+  if (demoMode && viewerRole === 'owner') {
+    try {
+      const snapshot = await demoApi('/api/owner/demo/sessions');
+      await restoreDemoSession(snapshot.sessions);
+    } catch (_) { /* The regular sync will refresh the locker list when the service reconnects. */ }
+  } else {
+    await syncNormalLockerSessions();
+  }
+  toast(`${message} Select another available locker and enter the camper's name again.`);
+}
 function resetSession(reopenName = false) {
   clearInterval(paymentTimer);
-  clearInterval(chargeTimer);
-  clearInterval(doorPollTimer);
-  doorPollTimer = null;
-  paymentTimer = chargeTimer = null;
+  paymentTimer = null;
   for (const id of ['nameDialog', 'pinDialog', 'paymentDialog', 'pickupDialog']) {
     const dialog = document.getElementById(id);
     if (dialog.open) dialog.close();
   }
   const oldLocker = locker;
   const oldSession = session;
+  const oldSessionKey = oldSession?.demoRecordId || oldSession?.storageId || oldLocker;
+  clearInterval(doorPollTimers.get(oldSessionKey));
+  doorPollTimers.delete(oldSessionKey);
+  if (oldSession?.storageId && sessionStorage.getItem('campconnect-active-session') === oldSession.storageId) {
+    sessionStorage.removeItem('campconnect-active-session');
+  }
   if (oldSession?.demoRecordId && sessionStorage.getItem(demoSessionStorageKey) === oldSession.demoRecordId) {
     sessionStorage.removeItem(demoSessionStorageKey);
   }
   if (oldSession?.demoRecordId && oldSession.status !== 'completed') {
     demoApi(`/api/owner/demo/sessions/${encodeURIComponent(oldSession.demoRecordId)}`, 'DELETE').catch(() => {});
+    lockerSessions.delete(String(oldLocker));
   }
   if (oldSession?.storageId && ['payment', 'pin-setup'].includes(oldSession.status)) {
     fetch(`/api/sessions/${encodeURIComponent(oldSession.storageId)}`, { method: 'DELETE' }).catch(() => {});
+    lockerSessions.delete(String(oldLocker));
   }
   session = null;
   pin = firstPin = pickupPin = '';
   coins = 0;
-  if (oldLocker) setLockerAvailable(oldLocker);
+  // Closing a name dialog for a locker that became occupied during the
+  // reservation must not redraw that active locker as available.
+  if (oldLocker && !lockerSessions.has(String(oldLocker))) setLockerAvailable(oldLocker);
   updateAvailableCount();
   if (reopenName && oldLocker) {
     $('#camperName').value = '';
@@ -326,108 +532,129 @@ function resetSession(reopenName = false) {
     setTimeout(() => open('nameDialog'), 180);
   } else locker = null;
 }
-function renderLockerState(state) {
-  const card = document.querySelector(`[data-locker="${locker}"]`);
+function renderLockerState(state, target = session) {
+  const card = document.querySelector(`[data-locker="${target?.locker ?? locker}"]`);
   if (!card) return;
-  if (state === 'charging') {
+  if (state === 'payment') {
     card.className = 'locker busy';
-    const canControlDemo = demoMode && viewerRole === 'owner';
-    card.innerHTML = `<div class="card-head"><b>LOCKER ${locker}</b><span class="badge busy-badge">IN USE</span></div><div class="locker-icon">▣</div><h3>Charging your device</h3><p>The locker remains closed</p><small id="remaining">Time remaining</small>${canControlDemo ? '<button class="tiny-demo" id="endDemoCharge" type="button">Bypass demo timer · stop charging</button>' : ''}`;
-    if (canControlDemo) $('#endDemoCharge').addEventListener('click', stopCharging);
+    card.innerHTML = `<div class="card-head"><b>LOCKER ${target?.locker ?? locker}</b><span class="badge busy-badge">SESSION IN PROGRESS</span></div><div class="locker-icon">▣</div><h3>Locker reserved</h3><p>Payment or PIN setup is in progress</p><small>CONTINUE THIS SESSION AT THE KIOSK</small>`;
+  } else if (state === 'charging') {
+    card.className = 'locker busy';
+    const canControlDemo = demoMode && viewerRole === 'owner' && target === session;
+    card.innerHTML = `<div class="card-head"><b>LOCKER ${target?.locker ?? locker}</b><span class="badge busy-badge">IN USE</span></div><div class="locker-icon">▣</div><h3>Charging your device</h3><p>The locker remains closed</p><small class="remaining">Time remaining</small>${canControlDemo ? '<button class="tiny-demo" data-charge-control type="button">Bypass demo timer · stop charging</button>' : ''}`;
+    if (canControlDemo) card.querySelector('[data-charge-control]')?.addEventListener('click', () => stopCharging(target));
   } else if (state === 'pickup') {
     card.className = 'locker busy pickup';
     card.setAttribute('role', 'button');
     card.tabIndex = 0;
-    card.innerHTML = `<div class="card-head"><b>LOCKER ${locker}</b><span class="badge busy-badge">READY FOR PICKUP</span></div><div class="locker-icon">▣</div><h3>Charging stopped</h3><p>Your items are still locked</p><small>Tap to enter your PIN</small>`;
+    card.innerHTML = `<div class="card-head"><b>LOCKER ${target?.locker ?? locker}</b><span class="badge busy-badge">READY FOR PICKUP</span></div><div class="locker-icon">▣</div><h3>Charging stopped</h3><p>Your items are still locked</p><small>Tap to enter your PIN</small>`;
   } else if (state === 'door') {
     card.className = 'locker busy';
     card.removeAttribute('role');
     card.removeAttribute('tabindex');
     const hasHardware = Boolean(lockerHardware());
-    const initialLoad = session?.status === 'loading-door';
-    card.innerHTML = `<div class="card-head"><b>LOCKER ${locker}</b><span class="badge open-badge">${initialLoad ? 'READY TO LOAD' : 'UNLOCKED'}</span></div><div class="locker-icon">▤</div><h3>${initialLoad ? 'Place your belongings inside' : 'Take your belongings'}</h3><p>${hasHardware ? 'Close the door to continue.' : 'Use the control below to simulate closing the door.'}</p>${hasHardware ? '<small>WAITING FOR DOOR SENSOR</small>' : `<button class="tiny-demo" id="finishDoor" type="button">${initialLoad ? 'Close door · start charging' : 'Close locker'}</button>`}`;
-    if (hasHardware) monitorDoorClosure();
-    else $('#finishDoor').addEventListener('click', initialLoad ? () => startCharging() : () => finishPickup());
+    const initialLoad = target?.status === 'loading-door';
+    card.innerHTML = `<div class="card-head"><b>LOCKER ${target?.locker ?? locker}</b><span class="badge open-badge">${initialLoad ? 'READY TO LOAD' : 'UNLOCKED'}</span></div><div class="locker-icon">▤</div><h3>${initialLoad ? 'Place your belongings inside' : 'Take your belongings'}</h3><p>${hasHardware ? 'Close the door to continue.' : 'Use the control below to simulate closing the door.'}</p>${hasHardware ? '<small>WAITING FOR DOOR SENSOR</small>' : `<button class="tiny-demo" data-door-action type="button">${initialLoad ? 'Close door · start charging' : 'Close locker'}</button>`}`;
+    if (hasHardware) monitorDoorClosure(target);
+    else card.querySelector('[data-door-action]')?.addEventListener('click', initialLoad ? () => startCharging(false, target) : () => finishPickup(target));
   } else if (state === 'opening-door') {
     card.className = 'locker busy';
     card.removeAttribute('role');
     card.removeAttribute('tabindex');
-    card.innerHTML = `<div class="card-head"><b>LOCKER ${locker}</b><span class="badge busy-badge">OPENING</span></div><div class="locker-icon">▣</div><h3>Opening locker</h3><p>Please wait for the door sensor.</p>`;
+    card.innerHTML = `<div class="card-head"><b>LOCKER ${target?.locker ?? locker}</b><span class="badge busy-badge">OPENING</span></div><div class="locker-icon">▣</div><h3>Opening locker</h3><p>Please wait for the door sensor.</p>`;
   }
   updateAvailableCount();
 }
-async function openLockerDoor(purpose) {
+async function openLockerDoor(purpose, target = session) {
+  if (!target) return;
   const loading = purpose === 'load';
-  session.status = loading ? 'loading-door' : 'opening-pickup-door';
+  target.status = loading ? 'loading-door' : 'opening-pickup-door';
   const hardware = lockerHardware();
   if (!hardware) {
-    session.status = loading ? 'loading-door' : 'door';
-    if (session.demoRecordId) saveDemoSession({ status: loading ? 'Loading gear' : 'Locker open' });
-    renderLockerState('door');
+    target.status = loading ? 'loading-door' : 'door';
+    if (target.demoRecordId) saveDemoSession({ status: loading ? 'Loading gear' : 'Locker open' }, target);
+    if (target.storageId) savePersistentSession({ status: loading ? 'Loading gear' : 'Locker open' }, target);
+    renderLockerState('door', target);
     return;
   }
-  renderLockerState('opening-door');
+  renderLockerState('opening-door', target);
   try {
-    await hardware.openLocker(String(locker));
-    session.status = loading ? 'loading-door' : 'door';
-    if (session.demoRecordId) saveDemoSession({ status: loading ? 'Loading gear' : 'Locker open' });
-    renderLockerState('door');
+    await hardware.openLocker(String(target.locker));
+    target.status = loading ? 'loading-door' : 'door';
+    if (target.demoRecordId) saveDemoSession({ status: loading ? 'Loading gear' : 'Locker open' }, target);
+    if (target.storageId) savePersistentSession({ status: loading ? 'Loading gear' : 'Locker open' }, target);
+    renderLockerState('door', target);
   } catch (error) {
-    session.status = loading ? 'loading-door' : 'pickup';
-    if (loading) renderLockerState('door');
+    target.status = loading ? 'loading-door' : 'pickup';
+    if (loading) renderLockerState('door', target);
     else {
-      renderLockerState('pickup');
-      $('#pickupError').textContent = 'The locker could not be opened. Please try again or contact staff.';
-      open('pickupDialog');
+      renderLockerState('pickup', target);
+      if (session === target) {
+        $('#pickupError').textContent = 'The locker could not be opened. Please try again or contact staff.';
+        open('pickupDialog');
+      }
     }
     toast(error?.message || 'The locker could not be opened. Please contact staff.');
   }
 }
-function monitorDoorClosure() {
-  clearInterval(doorPollTimer);
+function monitorDoorClosure(target = session) {
+  if (!target) return;
+  const key = target.demoRecordId || target.storageId || target.locker;
+  if (doorPollTimers.has(key)) return;
   const hardware = lockerHardware();
   if (!hardware) return;
   let sawOpenDoor = false;
-  doorPollTimer = setInterval(async () => {
-    if (!session || !['loading-door', 'door'].includes(session.status)) {
-      clearInterval(doorPollTimer);
-      doorPollTimer = null;
+  const timer = setInterval(async () => {
+    if (!['loading-door', 'door'].includes(target.status)) {
+      clearInterval(timer);
+      doorPollTimers.delete(key);
       return;
     }
     try {
-      const doorState = await hardware.getDoorState(String(locker));
+      const doorState = await hardware.getDoorState(String(target.locker));
       if (doorState === 'open') {
         sawOpenDoor = true;
         return;
       }
       if (doorState !== 'closed' || !sawOpenDoor) return;
-      clearInterval(doorPollTimer);
-      doorPollTimer = null;
-      if (session.status === 'loading-door') startCharging();
-      else finishPickup();
+      clearInterval(timer);
+      doorPollTimers.delete(key);
+      if (target.status === 'loading-door') startCharging(false, target);
+      else finishPickup(target);
     } catch (_) { /* Wait for another sensor reading. */ }
   }, 500);
+  doorPollTimers.set(key, timer);
 }
-async function finishPickup() {
-  if (!session || session.status !== 'door') return;
-  clearInterval(doorPollTimer);
-  doorPollTimer = null;
-  const finishedLocker = locker;
-  const finished = { sessionId: session.storageId || null, demoRecordId: session.demoRecordId || null };
-  if (session.demoRecordId) {
-    session.status = 'completed';
-    const usedMinutes = Math.max(1, Math.ceil((Date.now() - session.started) / 60000));
-    await saveDemoSession({ status: 'Completed', used: `${usedMinutes} min` });
+async function finishPickup(target = session) {
+  if (!target || target.status !== 'door') return;
+  const key = target.demoRecordId || target.storageId || target.locker;
+  clearInterval(doorPollTimers.get(key));
+  doorPollTimers.delete(key);
+  const finishedLocker = target.locker;
+  const finished = { sessionId: target.storageId || null, demoRecordId: target.demoRecordId || null };
+  if (target.demoRecordId) {
+    target.status = 'completed';
+    const usedMinutes = sessionUsedMinutes(target);
+    await saveDemoSession({ status: 'Completed', used: `${usedMinutes} min` }, target);
   }
-  if (session.storageId) {
-    session.status = 'completed';
-    const usedMinutes = Math.max(1, Math.ceil((Date.now() - session.started) / 60000));
-    await savePersistentSession({ status: 'Completed', usedMinutes }).catch(() => null);
+  if (target.storageId) {
+    target.status = 'completed';
+    const usedMinutes = sessionUsedMinutes(target);
+    await savePersistentSession({ status: 'Completed', usedMinutes }, target).catch(() => null);
   }
-  resetSession(false);
-  locker = null;
+  lockerSessions.delete(String(finishedLocker));
+  if (finished.storageId) {
+    if (sessionStorage.getItem('campconnect-active-session') === finished.storageId) sessionStorage.removeItem('campconnect-active-session');
+  }
+  if (finished.demoRecordId && sessionStorage.getItem(demoSessionStorageKey) === finished.demoRecordId) sessionStorage.removeItem(demoSessionStorageKey);
+  setLockerAvailable(finishedLocker);
+  if (session === target) {
+    resetSession(false);
+    locker = null;
+    showFeedback({ ...finished, locker: finishedLocker });
+  }
+  updateAvailableCount();
   toast('Locker closed. The kiosk is ready for the next camper.');
-  showFeedback({ ...finished, locker: finishedLocker });
 }
 function startPaymentTimer() {
   clearInterval(paymentTimer);
@@ -450,6 +677,11 @@ function chargingMinutes(total) {
   return Number.isInteger(total) && total >= 10 && total <= 100 && total % 10 === 0
     ? (total / 10) * 30
     : 0;
+}
+function sessionUsedMinutes(target) {
+  const saved = Number.parseInt(String(target?.used || '0'), 10) || 0;
+  const elapsed = Number.isFinite(target?.startedEpoch) ? Math.ceil((Date.now() - target.startedEpoch) / 60000) : saved;
+  return Math.max(1, saved, elapsed);
 }
 function updatePayment() {
   const minutes = chargingMinutes(coins);
@@ -492,13 +724,25 @@ function acceptCoin(amount) {
 }
 // The GPIO coin-slot adapter can call this when a coin pulse is detected.
 window.acceptKioskCoin = acceptCoin;
-function beginPinSetup() {
+async function beginPinSetup() {
   if (!chargingMinutes(coins)) return;
   clearInterval(paymentTimer);
   paymentTimer = null;
   pin = firstPin = '';
   pinStep = 'create';
   session.status = 'pin-setup';
+  try {
+    if (session.demoRecordId) await demoApi(`/api/owner/demo/sessions/${encodeURIComponent(session.demoRecordId)}`, 'PATCH', { status: 'PIN setup' });
+    else if (session.storageId) {
+      const response = await savePersistentSession({ status: 'PIN setup' }, session);
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(result.error || 'Could not save PIN setup.');
+    }
+  } catch (error) {
+    session.status = 'payment';
+    $('#paymentStatus').textContent = error.message;
+    return;
+  }
   $('#pinError').textContent = '';
   $('#pinTitle').textContent = 'Create your 6-digit PIN';
   $('#pinText').textContent = 'You will need this PIN to open the locker after charging finishes.';
@@ -507,64 +751,75 @@ function beginPinSetup() {
   $('#paymentDialog').close();
   open('pinDialog');
 }
-async function startCharging(resumeDemo = false) {
+async function startCharging(resumeDemo = false, target = session) {
   resumeDemo = resumeDemo === true;
-  const minutes = chargingMinutes(coins);
-  session.paid = coins;
+  const chargingSession = target;
+  if (!chargingSession) return;
+  const minutes = chargingMinutes(chargingSession.paid ?? coins);
+  chargingSession.paid = Number(chargingSession.paid ?? coins);
   if (resumeDemo) {
-    const savedStart = session.started_at ? Date.parse(session.started_at) : NaN;
-    const savedUsed = Number.parseInt(String(session.used || '0'), 10) || 0;
-    session.started = Number.isFinite(savedStart) ? savedStart : Date.now() - savedUsed * 60000;
-    session.lastReportedUsed = Math.max(savedUsed, Math.floor((Date.now() - session.started) / 60000));
+    const savedStart = chargingSession.started_at ? Date.parse(chargingSession.started_at) : NaN;
+    const savedUsed = Number.parseInt(String(chargingSession.used || '0'), 10) || 0;
+    chargingSession.startedEpoch = Number.isFinite(savedStart) ? savedStart : Date.now() - savedUsed * 60000;
+    chargingSession.lastReportedUsed = Math.max(savedUsed, Math.floor((Date.now() - chargingSession.startedEpoch) / 60000));
   } else {
-    session.started = Date.now();
-    session.lastReportedUsed = 0;
+    chargingSession.startedEpoch = Date.now();
+    chargingSession.lastReportedUsed = 0;
   }
-  session.status = 'charging';
+  chargingSession.status = 'charging';
+  lockerSessions.set(String(chargingSession.locker), chargingSession);
   if (!resumeDemo) {
     // Persist the door-closed transition before leaving the loading-door step.
     // Otherwise a quick dashboard switch can restore the older "Loading gear" state.
-    if (session.demoRecordId) {
+    if (chargingSession.demoRecordId) {
       try {
-        await demoApi(`/api/owner/demo/sessions/${encodeURIComponent(session.demoRecordId)}`, 'PATCH', {
-          status: 'Charging', paid: session.paid, minutes, used: '0 min'
+        await demoApi(`/api/owner/demo/sessions/${encodeURIComponent(chargingSession.demoRecordId)}`, 'PATCH', {
+          status: 'Charging', paid: chargingSession.paid, minutes, used: '0 min'
         });
       } catch (error) {
         toast(error?.message || 'Charging started, but the demo session could not be saved.');
       }
     }
-    savePersistentSession({ status: 'Charging', paid: session.paid, minutes, usedMinutes: 0 });
+    savePersistentSession({ status: 'Charging', paid: chargingSession.paid, minutes, usedMinutes: 0 }, chargingSession);
   }
-  expiry = session.started + minutes * 60 * 1000;
-  renderLockerState('charging');
-  if (expiry <= Date.now()) { stopCharging(); return; }
-  chargeTimer = setInterval(() => {
-    const left = Math.max(0, expiry - Date.now());
-    const usedMinutes = Math.floor((Date.now() - session.started) / 60000);
-    if (usedMinutes > session.lastReportedUsed) {
-      session.lastReportedUsed = usedMinutes;
-      saveDemoSession({ used: `${usedMinutes} min` });
-    savePersistentSession({ usedMinutes });
+  const expiresAt = chargingSession.startedEpoch + minutes * 60 * 1000;
+  renderLockerState('charging', chargingSession);
+  if (expiresAt <= Date.now()) { stopCharging(chargingSession); return; }
+  const timer = setInterval(() => {
+    const left = Math.max(0, expiresAt - Date.now());
+    const usedMinutes = Math.floor((Date.now() - chargingSession.startedEpoch) / 60000);
+    if (usedMinutes > chargingSession.lastReportedUsed) {
+      chargingSession.lastReportedUsed = usedMinutes;
+      saveDemoSession({ used: `${usedMinutes} min` }, chargingSession);
+      savePersistentSession({ usedMinutes }, chargingSession);
     }
-    const remaining = $('#remaining');
+    const card = document.querySelector(`[data-locker="${chargingSession.locker}"]`);
+    const remaining = card?.querySelector('.remaining');
     if (remaining) {
       const mins = Math.floor(left / 60000);
       const secs = Math.ceil((left % 60000) / 1000);
       remaining.textContent = `${mins}:${String(secs).padStart(2, '0')} remaining`;
     }
-    if (left <= 0) stopCharging();
+    if (left <= 0) stopCharging(chargingSession);
   }, 500);
+  const key = chargingSession.demoRecordId || chargingSession.storageId || chargingSession.locker;
+  chargeTimers.set(key, timer);
+  chargeTimer = timer;
   toast(`Charging started for ${minutes} minutes. The locker stays locked.`);
 }
-function stopCharging() {
-  if (!session || session.status !== 'charging') return;
-  clearInterval(chargeTimer);
-  chargeTimer = null;
-  session.status = 'pickup';
-  const usedMinutes = Math.max(1, Math.ceil((Date.now() - session.started) / 60000));
-  saveDemoSession({ status: 'Awaiting pickup', used: `${usedMinutes} min` });
-  savePersistentSession({ status: 'Awaiting pickup', usedMinutes });
-  renderLockerState('pickup');
+function stopCharging(chargingSession = session) {
+  if (!chargingSession || chargingSession.status !== 'charging') return;
+  const key = chargingSession.demoRecordId || chargingSession.storageId || chargingSession.locker;
+  const timer = chargeTimers.get(key);
+  clearInterval(timer);
+  chargeTimers.delete(key);
+  if (chargeTimer === timer) chargeTimer = null;
+  chargingSession.status = 'pickup';
+  lockerSessions.set(String(chargingSession.locker), chargingSession);
+  const usedMinutes = Math.max(1, Math.ceil((Date.now() - chargingSession.startedEpoch) / 60000));
+  saveDemoSession({ status: 'Awaiting pickup', used: `${usedMinutes} min` }, chargingSession);
+  savePersistentSession({ status: 'Awaiting pickup', usedMinutes }, chargingSession);
+  renderLockerState('pickup', chargingSession);
   toast('Charging stopped. The locker remains locked until the PIN is entered.');
 }
 
@@ -573,22 +828,32 @@ document.querySelectorAll('[data-coin]').forEach(button => button.addEventListen
 }));
 
 $('#lockerGrid').addEventListener('click', event => {
+  if (!lockerStateHydrated) return;
   const card = event.target.closest('[data-locker]');
   if (!card) return;
   const id = card.dataset.locker;
   if (card.classList.contains('available')) {
     locker = id;
+    coins = 0;
+    session = null;
     $('#camperName').value = '';
     $('#nameError').textContent = '';
+    $('#nameLockerPrompt').textContent = `Locker ${id} selected. Enter your name, then insert coins to select charging time.`;
     open('nameDialog');
-  } else if (session?.status === 'pickup' && session.locker === id) {
+  } else if ((lockerSessions.get(String(id)) || session)?.status === 'pickup'
+    && (lockerSessions.get(String(id))?.locker === id || session?.locker === id)) {
+    pickupTarget = lockerSessions.get(String(id)) || session;
+    session = pickupTarget;
+    locker = id;
+    if (pickupTarget.demoRecordId) sessionStorage.setItem(demoSessionStorageKey, pickupTarget.demoRecordId);
+    if (pickupTarget.storageId) sessionStorage.setItem('campconnect-active-session', pickupTarget.storageId);
     pickupPin = '';
     drawDots('pickupDots', '');
     $('#pickupError').textContent = '';
     $('#unlock').disabled = true;
     $('#pickupTitle').textContent = `Open locker ${id}`;
     open('pickupDialog');
-  } else if (session?.status === 'charging') {
+  } else if ((lockerSessions.get(String(id)) || session)?.status === 'charging') {
     toast('Charging is active. The locker remains locked.');
   }
 });
@@ -608,13 +873,17 @@ $('#nameForm').addEventListener('submit', async event => {
     try {
       const result = await demoApi('/api/owner/demo/sessions', 'POST', { name, locker });
       session.demoRecordId = result.session.id;
+      lockerSessions.set(String(locker), session);
       sessionStorage.setItem(demoSessionStorageKey, session.demoRecordId);
     } catch (error) {
-      session.demo = false;
-      demoMode = false;
-      $('#systemDemoBanner').hidden = true;
-      $('#demoCoinButtons').hidden = true;
+      session = null;
+      if (/^Locker \d+ is already occupied/i.test(error.message)) {
+        await recoverOccupiedLockerSelection(error.message);
+        return;
+      }
+      $('#nameError').textContent = error.message;
       toast(error.message);
+      return;
     }
   } else {
     try {
@@ -625,12 +894,20 @@ $('#nameForm').addEventListener('submit', async event => {
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw Error(result.error || 'Could not save this session on the kiosk.');
       session.storageId = result.id;
+      lockerSessions.set(String(locker), session);
+      sessionStorage.setItem('campconnect-active-session', session.storageId);
     } catch (error) {
       session = null;
+      if (/^Locker \d+ is already occupied/i.test(error.message)) {
+        await recoverOccupiedLockerSelection(error.message);
+        return;
+      }
       $('#nameError').textContent = error.message;
+      toast(error.message);
       return;
     }
   }
+  renderLockerState('payment');
   $('#nameDialog').close();
   $('#paymentStatus').textContent = '';
   $('#continuePin').disabled = true;
@@ -665,17 +942,41 @@ $('#pinNext').addEventListener('click', async () => {
       $('#pinError').textContent = error.message;
       return;
     }
+  } else if (session.storageId) {
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.storageId)}/pin`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin })
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(result.error || 'Could not save the PIN verifier.');
+    } catch (error) {
+      $('#pinError').textContent = error.message;
+      return;
+    }
   }
   session.pin = pin;
   $('#pinDialog').close();
   openLockerDoor('load');
 });
 $('#unlock').addEventListener('click', async () => {
-  if (!session || pickupPin.length !== 6) return;
-  let validPin = pickupPin === session.pin;
-  if (session.demoRecordId && demoMode) {
+  const target = pickupTarget || session;
+  if (!target || pickupPin.length !== 6) return;
+  let validPin = pickupPin === target.pin;
+  if (target.demoRecordId && demoMode) {
     try {
-      const result = await demoApi(`/api/owner/demo/sessions/${encodeURIComponent(session.demoRecordId)}/verify-pin`, 'POST', { pin: pickupPin });
+      const result = await demoApi(`/api/owner/demo/sessions/${encodeURIComponent(target.demoRecordId)}/verify-pin`, 'POST', { pin: pickupPin });
+      validPin = Boolean(result.valid);
+    } catch (error) {
+      $('#pickupError').textContent = error.message;
+      return;
+    }
+  } else if (target.storageId) {
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(target.storageId)}/verify-pin`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: pickupPin })
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(result.error || 'Could not verify the PIN.');
       validPin = Boolean(result.valid);
     } catch (error) {
       $('#pickupError').textContent = error.message;
@@ -689,10 +990,13 @@ $('#unlock').addEventListener('click', async () => {
     $('#pickupError').textContent = 'Incorrect PIN. Please try again.';
     return;
   }
-  session.status = 'door';
+  target.status = 'door';
+  session = target;
   $('#pickupDialog').close();
-  openLockerDoor('pickup');
+  openLockerDoor('pickup', target);
 });
+
+$('#pickupDialog').addEventListener('close', () => { pickupTarget = null; });
 
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => {
   const dialog = button.closest('dialog');
@@ -1030,7 +1334,9 @@ feedbackForm.addEventListener('submit', async event => {
 buildNameKeys();
 buildPinPad('pinKeys', editCreatePin);
 buildPinPad('pickupKeys', editPickupPin);
-updateAvailableCount();
+$('#lockerGrid').inert = true;
+$('#lockerStatusNote').textContent = 'Checking saved locker sessions…';
+$('#availableCount').textContent = 'Checking lockers…';
 const setClock = () => $('#clock').textContent = `Local time · ${new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit' }).format(new Date())}`;
 setClock();
 setInterval(setClock, 30000);
@@ -1058,5 +1364,7 @@ fetch('/api/me').then(response => {
   }
   if (session?.status === 'charging') renderLockerState('charging');
 }).catch(() => {});
+syncNormalLockerSessions();
+setInterval(syncNormalLockerSessions, 2500);
 refreshTransportStatus();
 setInterval(refreshTransportStatus, 5000);
