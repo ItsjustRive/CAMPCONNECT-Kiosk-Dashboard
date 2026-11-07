@@ -6,11 +6,7 @@ let demoSnapshot = { reportSessions: [], feedback: [], recoveryAudit: [] };
 let demoLiveEnergy = null;
 let liveOwnerData = { sessions: [], revenue: 0, count: 0, financial_count: 0, average: 0, energy_kwh: 0, energy_series: [] };
 let communicationMode = 'lora';
-const demoFinancials = {
-  'Today': { revenue: 250, costs: 50, sessions: 2 },
-  'This week': { revenue: 1520, costs: 380, sessions: 18 },
-  'This month': { revenue: 4820, costs: 1190, sessions: 56 }
-};
+const demoCosts = { 'Today': 50, 'This week': 380, 'This month': 1190 };
 const demoEnergy = {
   'Today': [0.00, 0.02, 0.03, 0.01, 0.02, 0.05, 0.12, 0.18, 0.23, 0.16, 0.11, 0.14, 0.21, 0.17, 0.12, 0.19, 0.26, 0.31, 0.22, 0.16, 0.14, 0.19, 0.12, 0.06],
   'This week': [2.35, 3.10, 2.80, 4.25, 3.65, 5.10, 4.40],
@@ -121,29 +117,41 @@ function renderEnergyChart(period) {
 }
 function renderFinancials() {
   const period = $('#period').value;
-  const demo = demoFinancials[period];
-  const createdDemoRows = demoActive ? demoRowsForPeriod(period).filter(row => !row.demo_sample) : [];
-  const revenue = demoActive ? demo.revenue + createdDemoRows.reduce((sum, row) => sum + (Number(row.paid) || 0), 0) : liveOwnerData.revenue;
-  const costs = demoActive ? (demoCostOverrides[period] ?? demo.costs) : savedCost(period);
+  const demoRows = demoActive ? demoRowsForPeriod(period) : [];
+  const demoPaidRows = demoRows.filter(row => Number(row.paid) > 0);
+  const revenue = demoActive ? demoPaidRows.reduce((sum, row) => sum + Number(row.paid), 0) : liveOwnerData.revenue;
+  const costs = demoActive ? (demoCostOverrides[period] ?? demoCosts[period]) : savedCost(period);
   const result = revenue - costs;
   $('#revenue').textContent = peso(revenue);
   $('#revenueNote').textContent = demoActive ? 'Temporary demo values · not saved' : liveOwnerData.financial_count ? 'Payments from active and completed sessions stored on this kiosk' : 'No payment records yet';
   $('#costs').textContent = peso(costs);
   $('#costCardNote').textContent = demoActive ? 'Temporary demo estimate' : 'Owner-entered estimate';
   $('#profit').textContent = peso(result);
-  const sessionCount = demo.sessions + createdDemoRows.length;
+  const sessionCount = demoPaidRows.length;
   $('#sessionCount').textContent = demoActive ? String(sessionCount) : String(liveOwnerData.financial_count ?? liveOwnerData.count);
-  $('#averagePayment').textContent = demoActive ? peso(sessionCount ? revenue / sessionCount : 0) : peso(liveOwnerData.average);
+  $('#mostCommonPayment').textContent = demoActive ? mostCommonPayment(demoPaidRows.map(row => Number(row.paid))) : mostCommonPaymentFromCounts(liveOwnerData.payment_breakdown || []);
   $('#refunds').textContent = '₱0';
   $('#financialNote').textContent = demoActive ? 'Temporary simulated figures plus payments collected during this demo.' : 'Collected payments include active and completed sessions stored on this kiosk.';
   $('#costNote').textContent = demoActive ? 'Demo cost changes disappear when demo mode stops.' : 'This estimate is saved in this browser for the selected period.';
   $('#costInput').value = costs;
   $('#chartMode').textContent = demoActive ? 'DEMO DATA' : 'LIVE DATA';
   $('#chartCaption').textContent = demoActive
-    ? 'Sample figures are temporary and disappear when demo mode stops.'
+    ? 'Revenue is the sum of sample and camper payments in the selected period. Operating costs use the owner estimate.'
     : 'Revenue and completed sessions come from locally stored records. Expenses use your saved estimate.';
   renderFinancialChart(revenue, costs, result, period);
   renderEnergyChart(period);
+}
+function mostCommonPayment(amounts) {
+  const counts = new Map();
+  for (const amount of amounts) counts.set(amount, (counts.get(amount) || 0) + 1);
+  const highest = Math.max(0, ...counts.values());
+  if (!highest) return peso(0);
+  return [...counts.entries()].filter(([, count]) => count === highest).map(([amount]) => amount).sort((a, b) => a - b).map(peso).join(' / ');
+}
+function mostCommonPaymentFromCounts(rows) {
+  const highest = Math.max(0, ...rows.map(row => Number(row.count) || 0));
+  if (!highest) return peso(0);
+  return rows.filter(row => Number(row.count) === highest).map(row => Number(row.amount)).sort((a, b) => a - b).map(peso).join(' / ');
 }
 function demoRowsForPeriod(period) {
   const now = new Date();
@@ -378,7 +386,10 @@ $('#period').addEventListener('change', () => { renderDemo(demoActive, demoSnaps
 
 $('#exportOwnerReport').addEventListener('click', async () => {
   try {
-    const response = await fetch('/api/owner/reports/export', { method: 'POST' });
+    const response = await fetch('/api/owner/reports/export', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ demo_costs: demoCostOverrides })
+    });
     if (!response.ok) {
       if (response.status === 401) location.href = '/login';
       throw Error('Could not create the report.');
