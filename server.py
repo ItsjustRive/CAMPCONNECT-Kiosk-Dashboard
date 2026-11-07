@@ -1409,17 +1409,33 @@ def owner_feedback():
             if start_dt <= created_dt < end_dt:
                 feedback.append(row)
         feedback.sort(key=lambda item: item["created_at"], reverse=True)
+        eligible = 0
+        demo_rows = app.config["DEMO_REPORT_SESSIONS"] + list(app.config["DEMO_SESSIONS"])
+        for row in demo_rows:
+            if row.get("status") not in {"Completed", "Recovered"}:
+                continue
+            try:
+                completed_at = datetime.fromisoformat(row.get("returned_at") or row.get("created_at")).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if start_dt <= completed_at < end_dt:
+                eligible += 1
     else:
         with connect_db() as con:
             rows = con.execute("""
                 SELECT rating, comment, created_at, locker FROM camper_feedback
                 WHERE created_at >= ? AND created_at < ? ORDER BY created_at DESC
             """, (start, end)).fetchall()
+            eligible = con.execute("""
+                SELECT COUNT(*) FROM camper_sessions
+                WHERE status IN ('Completed','Recovered') AND ended_at >= ? AND ended_at < ?
+            """, (start, end)).fetchone()[0]
         feedback = [{"rating": row["rating"], "comment": row["comment"],
                      "created_at": row["created_at"], "locker": row["locker"]} for row in rows]
     satisfied = sum(item["rating"] >= 4 for item in feedback)
     return jsonify(period=period, feedback=feedback, total=len(feedback), satisfied=satisfied,
-                   needs_improvement=len(feedback) - satisfied)
+                   needs_improvement=len(feedback) - satisfied, eligible=eligible,
+                   no_feedback=max(0, eligible - len(feedback)))
 
 
 @app.get("/api/owner/feedback.csv")
