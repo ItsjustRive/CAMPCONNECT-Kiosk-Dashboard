@@ -1683,10 +1683,16 @@ def owner_sessions():
             SELECT COALESCE(SUM(paid_php),0) AS revenue, COUNT(*) AS count
             FROM camper_sessions WHERE paid_php > 0 AND created_at >= ? AND created_at < ?
         """, (start, end)).fetchone()
+        payment_breakdown = con.execute("""
+            SELECT paid_php AS amount, COUNT(*) AS count FROM camper_sessions
+            WHERE paid_php > 0 AND created_at >= ? AND created_at < ?
+            GROUP BY paid_php ORDER BY paid_php
+        """, (start, end)).fetchall()
     revenue, paid_count = int(payment_summary["revenue"]), int(payment_summary["count"])
     energy_series = owner_energy_series(period, start, end)
     return jsonify(sessions=rows, revenue=revenue, count=len(rows), financial_count=paid_count,
                    average=(revenue / paid_count if paid_count else 0),
+                   payment_breakdown=[dict(row) for row in payment_breakdown],
                    energy_kwh=round(sum(energy_series), 3), energy_series=energy_series)
 
 
@@ -1766,45 +1772,49 @@ def export_report():
     from io import StringIO
     from flask import send_file
     cleanup_expired_sessions()
+    payload = request.get_json(silent=True) or {}
     output = StringIO(newline="")
     writer = csv.writer(output)
     if app.config["DEMO_ACTIVE"]:
         writer.writerow(["OWNER DEMO REPORT", "Temporary data; removed when demo mode stops"])
         writer.writerow([])
         writer.writerow(["Financial overview"])
-        writer.writerow(["Period", "Demo revenue PHP", "Estimated costs PHP", "Completed session count", "Operating result PHP"])
-        financials = {"Today": (250, 50, 2), "This week": (1520, 380, 18), "This month": (4820, 1190, 56)}
-        demo_rows = app.config["DEMO_REPORT_SESSIONS"] + [
-            row for row in app.config["DEMO_SESSIONS"]
-        ]
-        created_rows = [row for row in demo_rows if not row.get("demo_sample") and row.get("status") in {"Completed", "Recovered"}]
-        for period, (base_revenue, costs, base_count) in financials.items():
+        writer.writerow(["Period", "Demo revenue PHP", "Estimated costs PHP", "Paid session count", "Most common payment PHP", "Operating result PHP"])
+        demo_costs = {"Today": 50, "This week": 380, "This month": 1190}
+        supplied_costs = payload.get("demo_costs") if isinstance(payload.get("demo_costs"), dict) else {}
+        for key in demo_costs:
+            value = supplied_costs.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 10000000:
+                demo_costs[key] = value
+        demo_rows = app.config["DEMO_REPORT_SESSIONS"] + list(app.config["DEMO_SESSIONS"])
+
+        def demo_period_rows(period):
             start, end = owner_period_bounds(period)
             start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
-            period_rows = []
-            for row in created_rows:
+            matching = []
+            for row in demo_rows:
                 try:
                     when = datetime.fromisoformat(row.get("returned_at") or row.get("created_at")).astimezone(timezone.utc)
                 except (TypeError, ValueError):
                     continue
                 if start_dt <= when < end_dt:
-                    period_rows.append(row)
-            paid = sum(int(row.get("paid", 0) or 0) for row in period_rows)
-            revenue = base_revenue + paid
-            writer.writerow([period, revenue, costs, base_count + len(period_rows), revenue - costs])
+                    matching.append(row)
+            return matching
+
+        for period, costs in demo_costs.items():
+            period_rows = demo_period_rows(period)
+            paid_rows = [row for row in period_rows if int(row.get("paid", 0) or 0) > 0]
+            revenue = sum(int(row.get("paid", 0) or 0) for row in paid_rows)
+            frequencies = {}
+            for row in paid_rows:
+                amount = int(row.get("paid", 0) or 0)
+                frequencies[amount] = frequencies.get(amount, 0) + 1
+            most_common = " / ".join(str(amount) for amount, count in sorted(frequencies.items()) if count == max(frequencies.values(), default=0))
+            writer.writerow([period, revenue, costs, len(paid_rows), most_common, revenue - costs])
+        writer.writerow([])
         writer.writerow(["Financial chart values", "Revenue PHP", "Expenses PHP", "Operating result PHP"])
-        for period, (base_revenue, costs, _) in financials.items():
-            start, end = owner_period_bounds(period)
-            start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
-            period_rows = []
-            for row in created_rows:
-                try:
-                    when = datetime.fromisoformat(row.get("returned_at") or row.get("created_at")).astimezone(timezone.utc)
-                except (TypeError, ValueError):
-                    continue
-                if start_dt <= when < end_dt:
-                    period_rows.append(row)
-            revenue = base_revenue + sum(int(row.get("paid", 0) or 0) for row in period_rows)
+        for period, costs in demo_costs.items():
+            revenue = sum(int(row.get("paid", 0) or 0) for row in demo_period_rows(period))
             writer.writerow([period, revenue, costs, revenue - costs])
         writer.writerow([])
         writer.writerow(["Energy consumption"])
