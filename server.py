@@ -6,11 +6,14 @@ import os
 import platform
 import re
 import secrets
+import signal
 import sqlite3
 import socket
 import subprocess
 import tempfile
+import threading
 import csv
+import calendar
 import io
 import math
 import xml.etree.ElementTree as ET
@@ -19,7 +22,8 @@ from flask import Flask, abort, jsonify, redirect, request, send_file, send_from
 from werkzeug.security import check_password_hash
 
 ROOT = Path(__file__).resolve().parent
-PHONE_APP_ROOT = ROOT.parent / "phone campconnect"
+_bundled_phone_app = ROOT / "phone campconnect"
+PHONE_APP_ROOT = _bundled_phone_app if _bundled_phone_app.is_dir() else ROOT.parent / "phone campconnect"
 DATA = ROOT / "data"
 REPORTS = DATA / "reports"
 DB = DATA / "kiosk.sqlite3"
@@ -43,6 +47,7 @@ app.config["DEMO_RECOVERY_AUDIT"] = []
 app.config["DEMO_REPORT_SESSIONS"] = []
 app.config["DEMO_FEEDBACK"] = []
 app.config["DEMO_PIN_HASHES"] = {}
+app.config["DEMO_LOCK"] = threading.RLock()
 app.config["HARDWARE_STATUS"] = {
     "battery_detected": False, "battery_percent": None, "lora_connected": False,
     "energy_meter_detected": False, "energy_kwh": None,
@@ -59,20 +64,29 @@ def default_demo_sessions():
 def default_demo_report_sessions():
     now = datetime.now().astimezone()
     examples = [
-        ("Demo Camper One", "02", 100, 30, 0.42, 0),
-        ("Demo Camper Two", "03", 50, 24, 0.31, 3),
-        ("Demo Camper Three", "01", 80, 45, 0.57, 10),
+        ("Ava Morgan", "01", 20, 60, 0.42, 0, 5),
+        ("Noah Bennett", "02", 10, 30, 0.31, 0, 4),
+        ("Mia Carter", "03", 30, 90, 0.57, 0, 5),
+        ("Ethan Brooks", "01", 20, 60, 0.36, 0, 4),
+        ("Sofia Reyes", "02", 10, 30, 0.28, 0, 5),
+        ("Liam Foster", "03", 40, 120, 0.63, 0, 4),
+        ("Isla Hughes", "01", 20, 60, 0.47, 0, 5),
+        ("Lucas Price", "02", 10, 30, 0.22, 0, 3),
+        ("Amara Cole", "03", 30, 90, 0.51, 0, 5),
+        ("Kai Santos", "01", 20, 60, 0.39, 0, 4),
     ]
     rows = []
-    for name, locker, paid, minutes, energy, days_ago in examples:
+    for index, (name, locker, paid, minutes, energy, days_ago, rating) in enumerate(examples, 1):
         returned_at = now - timedelta(days=days_ago)
         rows.append({
-            "id": f"demo-sample-{locker}", "name": name, "locker": locker,
+            "id": f"demo-sample-{index:02d}", "name": name, "locker": locker,
             "paid": paid, "minutes": minutes, "used": f"{minutes} min",
             "status": "Completed", "energy": energy,
             "started": (returned_at - timedelta(minutes=minutes)).strftime("%I:%M %p").lstrip("0"),
             "returned": returned_at.strftime("%I:%M %p").lstrip("0"),
-            "created_at": returned_at.isoformat(timespec="seconds"), "demo_sample": True,
+            "created_at": returned_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            "returned_at": returned_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            "rating": rating, "demo_sample": True,
         })
     return rows
 
@@ -80,10 +94,43 @@ def default_demo_report_sessions():
 def default_demo_feedback():
     now = datetime.now().astimezone()
     return [
-        {"locker": "02", "rating": 5, "comment": "Quick and easy to use.", "created_at": (now - timedelta(hours=2)).isoformat(timespec="seconds")},
-        {"locker": "03", "rating": 4, "comment": "Charging worked well.", "created_at": (now - timedelta(hours=5)).isoformat(timespec="seconds")},
-        {"locker": "01", "rating": 3, "comment": "Could use clearer instructions.", "created_at": (now - timedelta(days=2)).isoformat(timespec="seconds")},
+        {"locker": row["locker"], "rating": row["rating"], "comment": comment,
+         "created_at": row["returned_at"]}
+        for row, comment in zip(default_demo_report_sessions(), [
+            "Quick and easy to use.", "Clear payment steps.", "Charging worked well.",
+            "Locker selection was simple.", "Helpful status updates.", "Good charging time options.",
+            "Easy to retrieve my device.", "Could use clearer instructions.",
+            "The process was smooth.", "Would use the service again.",
+        ])
     ]
+
+
+def normalized_camper_name(value):
+    return " ".join(str(value or "").split()).casefold()
+
+
+def ensure_camper_slot_available(name, locker, *, demo=False, con=None):
+    key = normalized_camper_name(name)
+    if demo:
+        active = [row for row in app.config["DEMO_SESSIONS"] if row.get("status") != "Completed"]
+        with connect_db() as database:
+            natural = database.execute("SELECT camper_name, locker FROM camper_sessions WHERE status NOT IN ('Completed','Recovered')").fetchall()
+        if any(normalized_camper_name(row.get("name")) == key for row in active) or any(normalized_camper_name(row["camper_name"]) == key for row in natural):
+            return "This camper already has an active locker session."
+        if any(str(row.get("locker")) == locker for row in active) or any(str(row["locker"]) == locker for row in natural):
+            return f"Locker {locker} is already occupied. Choose another locker."
+        return None
+    if con is None:
+        with connect_db() as database:
+            rows = database.execute("SELECT camper_name, locker FROM camper_sessions WHERE status NOT IN ('Completed','Recovered')").fetchall()
+    else:
+        rows = con.execute("SELECT camper_name, locker FROM camper_sessions WHERE status NOT IN ('Completed','Recovered')").fetchall()
+    demo_rows = [row for row in app.config["DEMO_SESSIONS"] if row.get("status") != "Completed"] if app.config["DEMO_ACTIVE"] else []
+    if any(normalized_camper_name(row["camper_name"]) == key for row in rows) or any(normalized_camper_name(row.get("name")) == key for row in demo_rows):
+        return "This camper already has an active locker session."
+    if any(str(row["locker"]) == locker for row in rows) or any(str(row.get("locker")) == locker for row in demo_rows):
+        return f"Locker {locker} is already occupied. Choose another locker."
+    return None
 
 
 def connect_db():
@@ -109,8 +156,8 @@ def init_db():
             id TEXT PRIMARY KEY, camper_name TEXT NOT NULL, locker TEXT NOT NULL,
             paid_php INTEGER NOT NULL DEFAULT 0, minutes_paid INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
-            ended_at TEXT, used_minutes INTEGER NOT NULL DEFAULT 0,
-            energy_kwh REAL
+            ended_at TEXT, used_minutes INTEGER NOT NULL DEFAULT 0, pin_hash TEXT,
+            energy_kwh REAL, energy_start_kwh REAL
         );
         CREATE INDEX IF NOT EXISTS idx_camper_sessions_started ON camper_sessions(started_at);
         CREATE INDEX IF NOT EXISTS idx_camper_sessions_status ON camper_sessions(status);
@@ -125,7 +172,8 @@ def init_db():
             resolved_by TEXT, resolved_role TEXT, responder_latitude REAL,
             responder_longitude REAL, responder_accuracy_m REAL, responder_location_at TEXT, responder_source TEXT,
             responder_message TEXT, responder_message_at TEXT,
-            camper_reply_message TEXT, camper_reply_at TEXT
+            camper_reply_message TEXT, camper_reply_at TEXT,
+            camper_reply_sent_at TEXT, camper_reply_delivery_status TEXT
         );
         CREATE TABLE IF NOT EXISTS camper_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT, locker TEXT NOT NULL,
@@ -135,6 +183,11 @@ def init_db():
         INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('communication_mode','lora',CURRENT_TIMESTAMP);
         """)
         emergency_columns = {row[1] for row in con.execute("PRAGMA table_info(emergency_alerts)").fetchall()}
+        session_columns = {row[1] for row in con.execute("PRAGMA table_info(camper_sessions)").fetchall()}
+        if "pin_hash" not in session_columns:
+            con.execute("ALTER TABLE camper_sessions ADD COLUMN pin_hash TEXT")
+        if "energy_start_kwh" not in session_columns:
+            con.execute("ALTER TABLE camper_sessions ADD COLUMN energy_start_kwh REAL")
         emergency_migrations = {
             "latitude": "REAL", "longitude": "REAL", "gps_accuracy_m": "REAL",
             "is_demo": "INTEGER NOT NULL DEFAULT 0", "sent_at": "TEXT",
@@ -144,6 +197,7 @@ def init_db():
             "responder_source": "TEXT",
             "responder_message": "TEXT",
             "responder_message_at": "TEXT", "camper_reply_message": "TEXT", "camper_reply_at": "TEXT",
+            "camper_reply_sent_at": "TEXT", "camper_reply_delivery_status": "TEXT",
         }
         for column, column_type in emergency_migrations.items():
             if column not in emergency_columns:
@@ -189,6 +243,7 @@ def session_record(row):
         "paid": row["paid_php"], "minutes": row["minutes_paid"],
         "started": started_local, "used": f'{row["used_minutes"]} min',
         "status": row["status"], "energy": row["energy_kwh"],
+        "started_at": row["started_at"], "created_at": row["created_at"],
         "returned": datetime.fromisoformat(row["ended_at"]).astimezone().strftime("%I:%M %p").lstrip("0") if row["ended_at"] else "—",
     }
 
@@ -429,6 +484,69 @@ def cleanup_expired_sessions():
         con.execute("DELETE FROM camper_sessions WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
 
 
+def write_weekly_report(week_start):
+    week_end = week_start + timedelta(days=7)
+    start_utc = datetime.combine(week_start, datetime.min.time()).astimezone().astimezone(timezone.utc).isoformat(timespec="seconds")
+    end_utc = datetime.combine(week_end, datetime.min.time()).astimezone().astimezone(timezone.utc).isoformat(timespec="seconds")
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["CAMP CONNECT WEEKLY SYSTEM REPORT", f"{week_start.isoformat()} through {(week_end - timedelta(days=1)).isoformat()}"])
+    writer.writerow([])
+    writer.writerow(["Camper sessions"])
+    writer.writerow(["Camper", "Locker", "Status", "Paid PHP", "Minutes paid", "Minutes used", "Energy kWh", "Created (UTC)", "Started (UTC)", "Ended (UTC)"])
+    with connect_db() as con:
+        rows = con.execute("""
+            SELECT camper_name,locker,status,paid_php,minutes_paid,used_minutes,energy_kwh,created_at,started_at,ended_at
+            FROM camper_sessions
+            WHERE (created_at >= ? AND created_at < ?) OR (started_at >= ? AND started_at < ?) OR (ended_at >= ? AND ended_at < ?)
+            ORDER BY created_at
+        """, (start_utc, end_utc, start_utc, end_utc, start_utc, end_utc)).fetchall()
+        writer.writerows([[row["camper_name"], row["locker"], row["status"], row["paid_php"], row["minutes_paid"], row["used_minutes"], row["energy_kwh"] if row["energy_kwh"] is not None else "Meter needed", row["created_at"], row["started_at"] or "", row["ended_at"] or ""] for row in rows])
+        writer.writerow([])
+        writer.writerow(["Camper feedback"])
+        writer.writerow(["Locker", "Date and time (UTC)", "Rating (1-5)", "Feedback"])
+        feedback = con.execute("SELECT locker,created_at,rating,comment FROM camper_feedback WHERE created_at >= ? AND created_at < ? ORDER BY created_at", (start_utc, end_utc)).fetchall()
+        writer.writerows([[row["locker"], row["created_at"], row["rating"], row["comment"]] for row in feedback])
+        writer.writerow([])
+        writer.writerow(["Locker recovery audit"])
+        writer.writerow(["Staff username", "Action", "Camper and locker", "Date and time (UTC)"])
+        audits = con.execute("""
+            SELECT COALESCE(u.username,'Unknown'),a.action,a.subject,a.created_at
+            FROM audit a LEFT JOIN users u ON u.id=a.actor_id
+            WHERE a.action='locker_recovered' AND a.created_at >= ? AND a.created_at < ? ORDER BY a.created_at
+        """, (start_utc, end_utc)).fetchall()
+        writer.writerows([list(row) for row in audits])
+        writer.writerow([])
+        writer.writerow(["Emergency alerts"])
+        writer.writerow(["Type", "Details", "Status", "Created (UTC)", "Sent (UTC)", "Responded by", "Responded (UTC)", "Resolved (UTC)"])
+        alerts = con.execute("""
+            SELECT alert_type,details,status,created_at,sent_at,responder_username,responded_at,resolved_at
+            FROM emergency_alerts WHERE created_at >= ? AND created_at < ? AND COALESCE(is_demo,0)=0 ORDER BY created_at
+        """, (start_utc, end_utc)).fetchall()
+        writer.writerows([list(row) for row in alerts])
+    filename = f"weekly-system-report-{week_start.strftime('%Y%m%d')}.csv"
+    (REPORTS / filename).write_text("\ufeff" + output.getvalue(), encoding="utf-8", newline="")
+    with connect_db() as con:
+        con.execute("INSERT INTO settings(key,value,updated_at) VALUES('last_weekly_report_week',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (week_start.isoformat(), now_iso()))
+    return filename
+
+
+def weekly_report_scheduler():
+    while True:
+        today = datetime.now().astimezone().date()
+        if today.weekday() == 0:
+            week_start = today - timedelta(days=7)
+            with connect_db() as con:
+                row = con.execute("SELECT value FROM settings WHERE key='last_weekly_report_week'").fetchone()
+            if not row or row["value"] != week_start.isoformat():
+                try:
+                    write_weekly_report(week_start)
+                    app.logger.info("Created automatic weekly report for week of %s", week_start.isoformat())
+                except Exception:
+                    app.logger.exception("Could not create automatic weekly report")
+        threading.Event().wait(60)
+
+
 init_db()
 cleanup_expired_reports()
 cleanup_expired_sessions()
@@ -466,7 +584,7 @@ def mobile_app():
 
 @app.get("/mobile/<path:asset>")
 def mobile_app_asset(asset):
-    allowed_assets = {"app.css", "app.js", "manifest.webmanifest", "icon.svg", "IOS_Emergency_Alert_Notification_-_Sound_Effect_HD.wav"}
+    allowed_assets = {"app.css", "app.js", "point-b-ble.js", "manifest.webmanifest", "icon.svg", "IOS_Emergency_Alert_Notification_-_Sound_Effect_HD.wav"}
     if asset not in allowed_assets:
         abort(404)
     return send_from_directory(PHONE_APP_ROOT, asset)
@@ -490,8 +608,60 @@ def login():
 
 @app.post("/api/logout")
 def logout():
+    if session.get("role") == "owner" and app.config["DEMO_ACTIVE"]:
+        clear_demo_state()
+        audit("demo_stopped", "owner signed out")
     session.clear()
     return jsonify(ok=True)
+
+
+def _tracked_kiosk_process_matches(pid):
+    if platform.system() != "Linux" or pid <= 1:
+        return False
+    process_dir = Path("/proc") / str(pid)
+    try:
+        if hasattr(os, "getuid") and process_dir.stat().st_uid != os.getuid():
+            return False
+        command = (process_dir / "cmdline").read_bytes().replace(b"\0", b" ").lower()
+    except (OSError, ValueError):
+        return False
+    return b"chromium" in command and b"--kiosk" in command and b"127.0.0.1:5000" in command
+
+
+@app.post("/api/kiosk/close")
+def close_kiosk_window():
+    if session.get("role") not in {"owner", "staff"}:
+        return jsonify(error="Sign in with an owner or staff account first."), 401
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return jsonify(error="The kiosk can only be closed from its local screen."), 403
+    origin = request.headers.get("Origin")
+    if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+        return jsonify(error="The kiosk close request must come from this dashboard."), 403
+    if platform.system() != "Linux":
+        return jsonify(error="This button is for the Raspberry Pi kiosk display."), 501
+
+    pid_file = Path("/tmp/campconnect-kiosk.pid")
+    try:
+        pid = int(pid_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return jsonify(error="Kiosk window is not tracked. Start it with start_kiosk.sh to enable this button."), 409
+    if not _tracked_kiosk_process_matches(pid):
+        try: pid_file.unlink()
+        except OSError: pass
+        return jsonify(error="The tracked Chromium kiosk window is no longer running."), 409
+
+    def stop_tracked_kiosk():
+        if _tracked_kiosk_process_matches(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                pid_file.unlink(missing_ok=True)
+            except OSError:
+                app.logger.exception("Could not close the tracked kiosk window")
+
+    timer = threading.Timer(0.8, stop_tracked_kiosk)
+    timer.daemon = True
+    timer.start()
+    return jsonify(ok=True, message="Closing the kiosk window. The dashboard server will keep running.")
 
 
 @app.get("/api/me")
@@ -599,6 +769,42 @@ def hardware_emergency_outbox():
     return jsonify(alerts=[dict(row) for row in rows])
 
 
+@app.get("/api/hardware/camper-reply-outbox")
+def hardware_camper_reply_outbox():
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return jsonify(error="Hardware message queue is available only to the local kiosk bridge."), 403
+    with connect_db() as con:
+        rows = con.execute("""
+            SELECT id,camper_reply_message AS message,camper_reply_at AS created_at,is_demo
+            FROM emergency_alerts
+            WHERE camper_reply_message IS NOT NULL AND camper_reply_sent_at IS NULL
+              AND camper_reply_delivery_status IS NULL
+            ORDER BY camper_reply_at ASC LIMIT 20
+        """).fetchall()
+    return jsonify(messages=[dict(row) for row in rows])
+
+
+@app.post("/api/hardware/camper-reply-outbox/<alert_id>/ack")
+def acknowledge_hardware_camper_reply(alert_id):
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return jsonify(error="Hardware message acknowledgments are available only to the local kiosk bridge."), 403
+    payload = request.get_json(silent=True) or {}
+    sent = payload.get("sent")
+    if not isinstance(sent, bool):
+        return jsonify(error="Provide sent as true or false."), 400
+    status = "Sent over LoRa" if sent else "LoRa send failed"
+    with connect_db() as con:
+        cursor = con.execute("""
+            UPDATE emergency_alerts
+            SET camper_reply_sent_at=CASE WHEN ? THEN COALESCE(camper_reply_sent_at, ?) ELSE camper_reply_sent_at END,
+                camper_reply_delivery_status=?
+            WHERE id=? AND camper_reply_message IS NOT NULL AND camper_reply_sent_at IS NULL
+        """, (sent, now_iso(), status, alert_id))
+    if cursor.rowcount == 0:
+        return jsonify(error="Pending camper reply not found."), 404
+    return jsonify(ok=True, status=status)
+
+
 @app.get("/api/hardware/sos-buzzer")
 def hardware_sos_buzzer_state():
     if request.remote_addr not in {"127.0.0.1", "::1"}:
@@ -694,18 +900,45 @@ def resolve_mobile_alert(alert_id):
     return jsonify(ok=True)
 
 
+@app.post("/api/hardware/alerts/<alert_id>/resolve")
+def resolve_hardware_alert(alert_id):
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return jsonify(error="Hardware alert updates are available only to the local kiosk bridge."), 403
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username", "")
+    role = payload.get("role")
+    if not isinstance(username, str) or len(username) > 80 or role not in {"owner", "staff"}:
+        return jsonify(error="A valid phone account is required to resolve this alert."), 400
+    username = username.strip() or "Phone responder"
+    now = now_iso()
+    with connect_db() as con:
+        cursor = con.execute("""
+            UPDATE emergency_alerts
+            SET status='Resolved', resolved_at=COALESCE(resolved_at, ?),
+                responded_at=COALESCE(responded_at, ?),
+                responder_username=COALESCE(responder_username, ?),
+                responder_role=COALESCE(responder_role, ?),
+                responder_source=COALESCE(responder_source, 'LoRa'),
+                resolved_by=COALESCE(resolved_by, ?), resolved_role=COALESCE(resolved_role, ?)
+            WHERE id=?
+        """, (now, now, username, role, username, role, alert_id))
+    if cursor.rowcount == 0:
+        return jsonify(error="Emergency alert not found."), 404
+    return jsonify(ok=True, status="Resolved")
+
+
 @app.post("/api/hardware/telemetry")
 def update_hardware_telemetry():
     if request.remote_addr not in {"127.0.0.1", "::1"}:
         return jsonify(error="Hardware telemetry is accepted only from this device."), 403
     payload = request.get_json(silent=True) or {}
-    detected = payload.get("battery_detected") is True
-    percent = payload.get("battery_percent")
+    current = app.config["HARDWARE_STATUS"]
+    detected = payload.get("battery_detected") is True if "battery_detected" in payload else current.get("battery_detected", False)
+    percent = payload.get("battery_percent", current.get("battery_percent"))
     if detected and (not isinstance(percent, (int, float)) or isinstance(percent, bool) or not 0 <= percent <= 100):
         return jsonify(error="A detected battery must report a percentage from 0 to 100."), 400
-    current = app.config["HARDWARE_STATUS"]
-    energy_detected = payload.get("energy_meter_detected") is True
-    energy_kwh = payload.get("energy_kwh")
+    energy_detected = payload.get("energy_meter_detected") is True if "energy_meter_detected" in payload else current.get("energy_meter_detected", False)
+    energy_kwh = payload.get("energy_kwh", current.get("energy_kwh"))
     if energy_detected and (not isinstance(energy_kwh, (int, float)) or isinstance(energy_kwh, bool)
                             or not math.isfinite(energy_kwh) or energy_kwh < 0):
         return jsonify(error="A detected energy meter must report a non-negative kWh reading."), 400
@@ -764,7 +997,7 @@ def update_hardware_telemetry():
     app.config["HARDWARE_STATUS"] = {
         "battery_detected": detected,
         "battery_percent": round(float(percent)) if detected else None,
-        "lora_connected": payload.get("lora_connected") is True,
+        "lora_connected": payload.get("lora_connected") is True if "lora_connected" in payload else current.get("lora_connected", False),
         "energy_meter_detected": energy_detected if "energy_meter_detected" in payload else current.get("energy_meter_detected", False),
         "energy_kwh": float(energy_kwh) if energy_detected else None if "energy_meter_detected" in payload else current.get("energy_kwh"),
         "gps_fix": gps_fix if gps_fields_present else current.get("gps_fix", False),
@@ -781,6 +1014,14 @@ def update_hardware_telemetry():
         "responder_updated_at": now_iso() if responder_location_present else current.get("responder_updated_at") if same_responder_alert else None,
         "responder_alert_id": responder_alert_id,
     }
+    if energy_detected and energy_kwh is not None:
+        energy_reading = float(energy_kwh)
+        with connect_db() as con:
+            con.execute("UPDATE camper_sessions SET energy_start_kwh=? WHERE status='Charging' AND energy_start_kwh IS NULL", (energy_reading,))
+        if app.config["DEMO_ACTIVE"]:
+            for record in app.config["DEMO_SESSIONS"]:
+                if record.get("status") == "Charging" and record.get("energy_start") is None:
+                    record["energy_start"] = energy_reading
     if (responder_location_present or responder_identity_present or responder_message is not None) and responder_alert_id:
         with connect_db() as con:
             message_at = now_iso()
@@ -846,35 +1087,41 @@ def owner_wifi_connect():
 def demo_status():
     if session.get("role") not in {"owner", "staff"}:
         return jsonify(error="Please sign in with a staff or owner account."), 401
-    return jsonify(active=bool(app.config["DEMO_ACTIVE"]))
+    return jsonify(active=session.get("role") == "owner" and bool(app.config["DEMO_ACTIVE"]))
 
 
 @app.post("/api/owner/demo/start")
 @require_role("owner")
 def start_demo():
-    app.config["DEMO_ACTIVE"] = True
-    app.config["DEMO_SESSIONS"] = default_demo_sessions()
-    app.config["DEMO_HAS_CAMPER_INPUT"] = False
-    app.config["DEMO_RECOVERY_AUDIT"] = []
-    app.config["DEMO_REPORT_SESSIONS"] = default_demo_report_sessions()
-    app.config["DEMO_FEEDBACK"] = default_demo_feedback()
-    app.config["DEMO_PIN_HASHES"] = {}
+    with app.config["DEMO_LOCK"]:
+        app.config["DEMO_ACTIVE"] = True
+        app.config["DEMO_SESSIONS"] = default_demo_sessions()
+        app.config["DEMO_HAS_CAMPER_INPUT"] = False
+        app.config["DEMO_RECOVERY_AUDIT"] = []
+        app.config["DEMO_REPORT_SESSIONS"] = default_demo_report_sessions()
+        app.config["DEMO_FEEDBACK"] = default_demo_feedback()
+        app.config["DEMO_PIN_HASHES"] = {}
     audit("demo_started", session.get("username"))
     return jsonify(active=True)
+
+
+def clear_demo_state():
+    with app.config["DEMO_LOCK"]:
+        app.config["DEMO_ACTIVE"] = False
+        app.config["DEMO_SESSIONS"] = []
+        app.config["DEMO_HAS_CAMPER_INPUT"] = False
+        app.config["DEMO_RECOVERY_AUDIT"] = []
+        app.config["DEMO_REPORT_SESSIONS"] = []
+        app.config["DEMO_FEEDBACK"] = []
+        app.config["DEMO_PIN_HASHES"] = {}
+    with connect_db() as con:
+        con.execute("DELETE FROM emergency_alerts WHERE is_demo=1")
 
 
 @app.post("/api/owner/demo/stop")
 @require_role("owner")
 def stop_demo():
-    app.config["DEMO_ACTIVE"] = False
-    app.config["DEMO_SESSIONS"] = []
-    app.config["DEMO_HAS_CAMPER_INPUT"] = False
-    app.config["DEMO_RECOVERY_AUDIT"] = []
-    app.config["DEMO_REPORT_SESSIONS"] = []
-    app.config["DEMO_FEEDBACK"] = []
-    app.config["DEMO_PIN_HASHES"] = {}
-    with connect_db() as con:
-        con.execute("DELETE FROM emergency_alerts WHERE is_demo=1")
+    clear_demo_state()
     audit("demo_stopped", session.get("username"))
     return jsonify(active=False)
 
@@ -897,7 +1144,7 @@ def get_demo_sessions():
                      "created_at": row.get("returned_at", row.get("created_at"))}
                     for row in completed if row.get("rating"))
     return jsonify(sessions=app.config["DEMO_SESSIONS"], hasCamperInput=app.config["DEMO_HAS_CAMPER_INPUT"],
-                   reportSessions=app.config["DEMO_REPORT_SESSIONS"] + completed,
+                   reportSessions=app.config["DEMO_REPORT_SESSIONS"] + list(app.config["DEMO_SESSIONS"]),
                    feedback=feedback, recoveryAudit=app.config["DEMO_RECOVERY_AUDIT"])
 
 
@@ -921,23 +1168,27 @@ def create_demo_session():
     locker = str(payload.get("locker", ""))
     if not name or len(name) > 80 or locker not in {"01", "02", "03"}:
         return jsonify(error="Enter a camper name and a valid locker."), 400
-    if not app.config["DEMO_HAS_CAMPER_INPUT"]:
-        app.config["DEMO_SESSIONS"] = []
+    with app.config["DEMO_LOCK"]:
+        conflict = ensure_camper_slot_available(name, locker, demo=True)
+        if conflict:
+            return jsonify(error=conflict), 409
+        # New camper entries must never clear other active demo lockers.
+        # Demo state is reset only when the owner explicitly starts or stops a demo season.
         app.config["DEMO_HAS_CAMPER_INPUT"] = True
-    record = {
-        "id": secrets.token_urlsafe(12),
-        "name": name,
-        "locker": locker,
-        "started": datetime.now().astimezone().strftime("%I:%M %p").lstrip("0"),
-        "used": "0 min",
-        "status": "Waiting for payment",
-        "paid": 0,
-        "minutes": 0,
-        "energy": None,
-        "energy_start": app.config["HARDWARE_STATUS"].get("energy_kwh") if app.config["HARDWARE_STATUS"].get("energy_meter_detected") else None,
-        "created_at": now_iso(),
-    }
-    app.config["DEMO_SESSIONS"].append(record)
+        record = {
+            "id": secrets.token_urlsafe(12),
+            "name": name,
+            "locker": locker,
+            "started": datetime.now().astimezone().strftime("%I:%M %p").lstrip("0"),
+            "used": "0 min",
+            "status": "Waiting for payment",
+            "paid": 0,
+            "minutes": 0,
+            "energy": None,
+            "energy_start": app.config["HARDWARE_STATUS"].get("energy_kwh") if app.config["HARDWARE_STATUS"].get("energy_meter_detected") else None,
+            "created_at": now_iso(),
+        }
+        app.config["DEMO_SESSIONS"].append(record)
     return jsonify(session=record), 201
 
 
@@ -984,7 +1235,7 @@ def update_demo_session(session_id):
     if inactive:
         return inactive
     payload = request.get_json(silent=True) or {}
-    allowed = {"Waiting for payment", "Payment received", "Loading gear", "Charging", "Awaiting pickup", "Locker open", "Completed", "Recovered"}
+    allowed = {"Waiting for payment", "Payment received", "PIN setup", "Loading gear", "Charging", "Awaiting pickup", "Locker open", "Completed", "Recovered"}
     status = payload.get("status")
     if status is not None and status not in allowed:
         return jsonify(error="Invalid demo session status."), 400
@@ -1010,6 +1261,9 @@ def update_demo_session(session_id):
                 record["status"] = status
                 if status == "Charging":
                     record.setdefault("started_at", now_iso())
+                    hardware = app.config["HARDWARE_STATUS"]
+                    if hardware.get("energy_meter_detected") and hardware.get("energy_kwh") is not None:
+                        record["energy_start"] = hardware["energy_kwh"]
                 if status in {"Completed", "Recovered"}:
                     record["returned_at"] = now_iso()
                     record["returned"] = datetime.now().astimezone().strftime("%I:%M %p").lstrip("0")
@@ -1049,9 +1303,70 @@ def create_camper_session():
     session_id = secrets.token_urlsafe(18)
     created = now_iso()
     with connect_db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        conflict = ensure_camper_slot_available(name, locker, con=con)
+        if conflict:
+            return jsonify(error=conflict), 409
         con.execute("INSERT INTO camper_sessions(id,camper_name,locker,status,created_at) VALUES(?,?,?,?,?)",
                     (session_id, name, locker, "Waiting for payment", created))
     return jsonify(id=session_id), 201
+
+
+@app.get("/api/camper/active-sessions")
+def camper_active_sessions():
+    is_owner_demo = session.get("role") == "owner" and app.config["DEMO_ACTIVE"]
+    if is_owner_demo:
+        records = [row for row in app.config["DEMO_SESSIONS"] if row.get("status") != "Completed"]
+        with connect_db() as con:
+            natural_locks = [row["locker"] for row in con.execute("SELECT locker FROM camper_sessions WHERE status NOT IN ('Completed','Recovered')").fetchall()]
+        return jsonify(demo_active=True, sessions=[{
+            "id": row["id"], "locker": row["locker"], "status": row["status"],
+            "paid": row.get("paid", 0), "minutes": row.get("minutes", 0),
+            "used": row.get("used", "0 min"), "started_at": row.get("started_at"),
+            "created_at": row.get("created_at"), "returned": row.get("returned", "—"),
+        } for row in records], reserved_lockers=natural_locks)
+    with connect_db() as con:
+        rows = con.execute("""
+            SELECT id,locker,status,paid_php,minutes_paid,used_minutes,created_at,started_at
+            FROM camper_sessions WHERE status NOT IN ('Completed','Recovered') ORDER BY created_at DESC
+        """).fetchall()
+    return jsonify(demo_active=False, sessions=[{
+        "id": row["id"], "locker": row["locker"], "status": row["status"],
+        "paid": row["paid_php"], "minutes": row["minutes_paid"],
+        "used": f'{row["used_minutes"]} min', "started_at": row["started_at"],
+        "created_at": row["created_at"],
+    } for row in rows])
+
+
+@app.post("/api/sessions/<session_id>/pin")
+def save_camper_pin(session_id):
+    payload = request.get_json(silent=True) or {}
+    pin = payload.get("pin")
+    if not isinstance(pin, str) or not re.fullmatch(r"\d{6}", pin):
+        return jsonify(error="PIN must contain exactly six digits."), 400
+    from werkzeug.security import generate_password_hash
+    with connect_db() as con:
+        cursor = con.execute("UPDATE camper_sessions SET pin_hash=? WHERE id=? AND status IN ('Waiting for payment','Payment received','PIN setup')",
+                             (generate_password_hash(pin), session_id))
+    if cursor.rowcount == 0:
+        return jsonify(error="The camper session was not found or is no longer setting up a PIN."), 404
+    return jsonify(ok=True)
+
+
+@app.post("/api/sessions/<session_id>/verify-pin")
+def verify_camper_pin(session_id):
+    payload = request.get_json(silent=True) or {}
+    pin = payload.get("pin")
+    if not isinstance(pin, str) or not re.fullmatch(r"\d{6}", pin):
+        return jsonify(error="Enter a six-digit PIN."), 400
+    with connect_db() as con:
+        row = con.execute("SELECT pin_hash FROM camper_sessions WHERE id=? AND status IN ('Awaiting pickup','Recovered')", (session_id,)).fetchone()
+    if not row:
+        return jsonify(error="Locker session not found or is not ready for pickup."), 404
+    if not row["pin_hash"]:
+        return jsonify(error="This session has no saved PIN verifier. Contact staff for recovery."), 409
+    from werkzeug.security import check_password_hash
+    return jsonify(valid=check_password_hash(row["pin_hash"], pin))
 
 
 @app.post("/api/feedback")
@@ -1138,7 +1453,7 @@ def export_owner_feedback():
 @app.patch("/api/sessions/<session_id>")
 def update_camper_session(session_id):
     payload = request.get_json(silent=True) or {}
-    allowed_statuses = {"Waiting for payment", "Payment received", "Charging", "Awaiting pickup", "Completed"}
+    allowed_statuses = {"Waiting for payment", "Payment received", "PIN setup", "Loading gear", "Locker open", "Charging", "Awaiting pickup", "Completed"}
     status = payload.get("status")
     if status is not None and status not in allowed_statuses:
         return jsonify(error="Invalid session status."), 400
@@ -1165,6 +1480,10 @@ def update_camper_session(session_id):
         if status == "Charging":
             fields.append("started_at=COALESCE(started_at, ?)")
             values.append(now_iso())
+            hardware = app.config["HARDWARE_STATUS"]
+            if hardware.get("energy_meter_detected") and hardware.get("energy_kwh") is not None:
+                fields.append("energy_start_kwh=COALESCE(energy_start_kwh, ?)")
+                values.append(float(hardware["energy_kwh"]))
         if status == "Completed":
             fields.append("ended_at=?")
             values.append(now_iso())
@@ -1180,6 +1499,13 @@ def update_camper_session(session_id):
     if not fields:
         return jsonify(error="No session changes were provided."), 400
     with connect_db() as con:
+        if status == "Completed":
+            hardware = app.config["HARDWARE_STATUS"]
+            baseline = con.execute("SELECT energy_start_kwh FROM camper_sessions WHERE id=?", (session_id,)).fetchone()
+            if (baseline and baseline["energy_start_kwh"] is not None and hardware.get("energy_meter_detected")
+                    and hardware.get("energy_kwh") is not None):
+                fields.append("energy_kwh=?")
+                values.append(round(max(0, float(hardware["energy_kwh"]) - float(baseline["energy_start_kwh"])), 3))
         cursor = con.execute(f"UPDATE camper_sessions SET {', '.join(fields)} WHERE id=?", (*values, session_id))
     if cursor.rowcount == 0:
         return jsonify(error="Session not found."), 404
@@ -1199,7 +1525,7 @@ def delete_unpaid_camper_session(session_id):
 def staff_sessions():
     if session.get("role") not in {"staff", "owner"}:
         return jsonify(error="Please sign in with a staff or owner account."), 401
-    if app.config["DEMO_ACTIVE"]:
+    if session.get("role") == "owner" and app.config["DEMO_ACTIVE"]:
         rows = [row for row in app.config["DEMO_SESSIONS"] if row.get("status") not in {"Completed", "Recovered"}]
         return jsonify(sessions=rows, demo_active=True)
     with connect_db() as con:
@@ -1207,11 +1533,34 @@ def staff_sessions():
     return jsonify(sessions=[session_record(row) for row in rows], demo_active=False)
 
 
+@app.post("/api/staff/sessions/export")
+def export_staff_camper_records():
+    if session.get("role") not in {"staff", "owner"}:
+        return jsonify(error="Please sign in with a staff or owner account."), 401
+    demo_export = session.get("role") == "owner" and app.config["DEMO_ACTIVE"]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["Camper", "Locker", "Status", "Paid PHP", "Minutes paid", "Time used", "Energy kWh", "Created (UTC)", "Returned (local time)", "Record type"])
+    if demo_export:
+        rows = app.config["DEMO_REPORT_SESSIONS"] + list(app.config["DEMO_SESSIONS"])
+        writer.writerows([[row.get("name", ""), row.get("locker", ""), row.get("status", "Completed"), row.get("paid", 0), row.get("minutes", 0), row.get("used", "0 min"), row.get("energy") if row.get("energy") is not None else "Meter needed", row.get("created_at", ""), row.get("returned", ""), "Demo filler" if row.get("demo_sample") else "Created during demo"] for row in rows])
+        prefix = "demo-camper-records"
+    else:
+        with connect_db() as con:
+            rows = con.execute("SELECT * FROM camper_sessions ORDER BY created_at DESC").fetchall()
+        writer.writerows([[row["camper_name"], row["locker"], row["status"], row["paid_php"], row["minutes_paid"], f'{row["used_minutes"]} min', row["energy_kwh"] if row["energy_kwh"] is not None else "Meter needed", row["created_at"], row["ended_at"] or "", "Stored system record"] for row in rows])
+        prefix = "camper-records"
+    filename = prefix + "-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f") + ".csv"
+    path = REPORTS / filename
+    path.write_text("\ufeff" + output.getvalue(), encoding="utf-8", newline="")
+    return send_file(path, as_attachment=True, download_name=filename, mimetype="text/csv")
+
+
 @app.post("/api/staff/sessions/<session_id>/recover")
 def recover_camper_session(session_id):
     if session.get("role") not in {"staff", "owner"}:
         return jsonify(error="Please sign in with a staff or owner account."), 401
-    if app.config["DEMO_ACTIVE"]:
+    if session.get("role") == "owner" and app.config["DEMO_ACTIVE"]:
         for row in app.config["DEMO_SESSIONS"]:
             if row["id"] == session_id:
                 if row["status"] != "Awaiting pickup":
@@ -1229,12 +1578,17 @@ def recover_camper_session(session_id):
                 return jsonify(ok=True, demo=True)
         return jsonify(error="Demo session not found."), 404
     with connect_db() as con:
-        row = con.execute("SELECT camper_name, locker, status FROM camper_sessions WHERE id=?", (session_id,)).fetchone()
+        row = con.execute("SELECT camper_name, locker, status, energy_start_kwh FROM camper_sessions WHERE id=?", (session_id,)).fetchone()
         if not row:
             return jsonify(error="Session not found."), 404
         if row["status"] != "Awaiting pickup":
             return jsonify(error="Recovery is available after charging has ended."), 409
-        con.execute("UPDATE camper_sessions SET status='Recovered', ended_at=? WHERE id=?", (now_iso(), session_id))
+        hardware = app.config["HARDWARE_STATUS"]
+        if row["energy_start_kwh"] is not None and hardware.get("energy_meter_detected") and hardware.get("energy_kwh") is not None:
+            used_energy = round(max(0, float(hardware["energy_kwh"]) - float(row["energy_start_kwh"])), 3)
+            con.execute("UPDATE camper_sessions SET status='Recovered', ended_at=?, energy_kwh=? WHERE id=?", (now_iso(), used_energy, session_id))
+        else:
+            con.execute("UPDATE camper_sessions SET status='Recovered', ended_at=? WHERE id=?", (now_iso(), session_id))
     audit("locker_recovered", f'{row["camper_name"]} · locker {row["locker"]}')
     return jsonify(ok=True)
 
@@ -1243,7 +1597,7 @@ def recover_camper_session(session_id):
 def staff_recovery_audit():
     if session.get("role") not in {"staff", "owner"}:
         return jsonify(error="Please sign in with a staff or owner account."), 401
-    if app.config["DEMO_ACTIVE"]:
+    if session.get("role") == "owner" and app.config["DEMO_ACTIVE"]:
         return jsonify(entries=app.config["DEMO_RECOVERY_AUDIT"], demo_active=True)
     with connect_db() as con:
         rows = con.execute("""
@@ -1258,7 +1612,7 @@ def staff_recovery_audit():
 def export_staff_recovery_audit():
     if session.get("role") not in {"staff", "owner"}:
         return jsonify(error="Please sign in with a staff or owner account."), 401
-    if app.config["DEMO_ACTIVE"]:
+    if session.get("role") == "owner" and app.config["DEMO_ACTIVE"]:
         entries = app.config["DEMO_RECOVERY_AUDIT"]
         source = "demo"
     else:
@@ -1294,6 +1648,27 @@ def owner_period_bounds(period):
     return start, end
 
 
+def owner_energy_series(period, start, end):
+    now = datetime.now().astimezone()
+    size = 24 if period == "Today" else 7 if period == "This week" else calendar.monthrange(now.year, now.month)[1]
+    readings = [0.0] * size
+    with connect_db() as con:
+        rows = con.execute("""
+            SELECT energy_kwh, ended_at FROM camper_sessions
+            WHERE status IN ('Completed','Recovered') AND energy_kwh IS NOT NULL
+              AND ended_at >= ? AND ended_at < ?
+        """, (start, end)).fetchall()
+    for row in rows:
+        try:
+            ended = datetime.fromisoformat(row["ended_at"]).astimezone()
+        except (TypeError, ValueError):
+            continue
+        bucket = ended.hour if period == "Today" else ended.weekday() if period == "This week" else ended.day - 1
+        if 0 <= bucket < size:
+            readings[bucket] += float(row["energy_kwh"])
+    return [round(value, 3) for value in readings]
+
+
 @app.get("/api/owner/sessions")
 @require_role("owner")
 def owner_sessions():
@@ -1304,9 +1679,15 @@ def owner_sessions():
     start, end = owner_period_bounds(period)
     rows = completed_session_rows(start, end)
     with connect_db() as con:
-        energy = con.execute("SELECT COALESCE(SUM(energy_kwh),0) FROM camper_sessions WHERE status IN ('Completed','Recovered') AND ended_at >= ? AND ended_at < ?", (start, end)).fetchone()[0]
-    revenue = sum(row["paid"] for row in rows)
-    return jsonify(sessions=rows, revenue=revenue, count=len(rows), average=(revenue / len(rows) if rows else 0), energy_kwh=energy)
+        payment_summary = con.execute("""
+            SELECT COALESCE(SUM(paid_php),0) AS revenue, COUNT(*) AS count
+            FROM camper_sessions WHERE paid_php > 0 AND created_at >= ? AND created_at < ?
+        """, (start, end)).fetchone()
+    revenue, paid_count = int(payment_summary["revenue"]), int(payment_summary["count"])
+    energy_series = owner_energy_series(period, start, end)
+    return jsonify(sessions=rows, revenue=revenue, count=len(rows), financial_count=paid_count,
+                   average=(revenue / paid_count if paid_count else 0),
+                   energy_kwh=round(sum(energy_series), 3), energy_series=energy_series)
 
 
 @app.get("/api/owner/mobile-revenue")
@@ -1391,12 +1772,12 @@ def export_report():
         writer.writerow(["OWNER DEMO REPORT", "Temporary data; removed when demo mode stops"])
         writer.writerow([])
         writer.writerow(["Financial overview"])
-        writer.writerow(["Period", "Demo revenue PHP", "Estimated costs PHP", "Completed session count"])
+        writer.writerow(["Period", "Demo revenue PHP", "Estimated costs PHP", "Completed session count", "Operating result PHP"])
         financials = {"Today": (250, 50, 2), "This week": (1520, 380, 18), "This month": (4820, 1190, 56)}
         demo_rows = app.config["DEMO_REPORT_SESSIONS"] + [
-            row for row in app.config["DEMO_SESSIONS"] if row.get("status") in {"Completed", "Recovered"}
+            row for row in app.config["DEMO_SESSIONS"]
         ]
-        created_rows = [row for row in demo_rows if not row.get("demo_sample")]
+        created_rows = [row for row in demo_rows if not row.get("demo_sample") and row.get("status") in {"Completed", "Recovered"}]
         for period, (base_revenue, costs, base_count) in financials.items():
             start, end = owner_period_bounds(period)
             start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
@@ -1409,15 +1790,46 @@ def export_report():
                 if start_dt <= when < end_dt:
                     period_rows.append(row)
             paid = sum(int(row.get("paid", 0) or 0) for row in period_rows)
-            writer.writerow([period, base_revenue + paid, costs, base_count + len(period_rows)])
+            revenue = base_revenue + paid
+            writer.writerow([period, revenue, costs, base_count + len(period_rows), revenue - costs])
+        writer.writerow(["Financial chart values", "Revenue PHP", "Expenses PHP", "Operating result PHP"])
+        for period, (base_revenue, costs, _) in financials.items():
+            start, end = owner_period_bounds(period)
+            start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
+            period_rows = []
+            for row in created_rows:
+                try:
+                    when = datetime.fromisoformat(row.get("returned_at") or row.get("created_at")).astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                if start_dt <= when < end_dt:
+                    period_rows.append(row)
+            revenue = base_revenue + sum(int(row.get("paid", 0) or 0) for row in period_rows)
+            writer.writerow([period, revenue, costs, revenue - costs])
         writer.writerow([])
         writer.writerow(["Energy consumption"])
         writer.writerow(["Camper", "Locker", "Energy kWh", "Reading source"])
         writer.writerows([row.get("name"), row.get("locker"), row.get("energy") if row.get("energy") is not None else "Meter needed", "Sample demo" if row.get("demo_sample") else "Connected meter" if row.get("energy") is not None else "No meter reading"] for row in demo_rows)
         writer.writerow([])
-        writer.writerow(["Completed camper sessions"])
-        writer.writerow(["Camper", "Locker", "Paid PHP", "Time paid (minutes)", "Time used", "Energy kWh", "Returned"])
-        writer.writerows([[row.get("name"), row.get("locker"), row.get("paid", 0), row.get("minutes", 0), row.get("used", "0 min"), row.get("energy") if row.get("energy") is not None else "Meter needed", row.get("returned", "—")] for row in demo_rows])
+        writer.writerow(["Energy graph data", "Time bucket", "Energy kWh", "Reading source"])
+        today_readings = [0.00, 0.02, 0.03, 0.01, 0.02, 0.05, 0.12, 0.18, 0.23, 0.16, 0.11, 0.14, 0.21, 0.17, 0.12, 0.19, 0.26, 0.31, 0.22, 0.16, 0.14, 0.19, 0.12, 0.06]
+        week_readings = [2.35, 3.10, 2.80, 4.25, 3.65, 5.10, 4.40]
+        month_days = calendar.monthrange(datetime.now().astimezone().year, datetime.now().astimezone().month)[1]
+        month_readings = [round(1.1 + ((day * 7 + 3) % 13) * 0.31 + (day % 4) * 0.12, 2) for day in range(month_days)]
+        hardware = app.config["HARDWARE_STATUS"]
+        live_energy = hardware.get("energy_kwh") if hardware.get("energy_meter_detected") else None
+        chart_periods = (("Today", today_readings, lambda index: f"{index % 12 or 12}{'a' if index < 12 else 'p'}", datetime.now().hour),
+                         ("This week", week_readings, lambda index: ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[index], (datetime.now().weekday())),
+                         ("This month", month_readings, lambda index: f"Day {index + 1}", datetime.now().day - 1))
+        for period, readings, label_for, live_index in chart_periods:
+            for index, value in enumerate(readings):
+                if live_energy is not None:
+                    value = float(live_energy) if index == live_index else 0.0
+                writer.writerow([period, label_for(index), f"{value:.2f}", "Connected meter" if live_energy is not None else "Sample demo"])
+        writer.writerow([])
+        writer.writerow(["Demo camper sessions · filler and activity created during this demo"])
+        writer.writerow(["Camper", "Locker", "Status", "Paid PHP", "Time paid (minutes)", "Time used", "Energy kWh", "Started", "Returned"])
+        writer.writerows([[row.get("name"), row.get("locker"), row.get("status", "Completed"), row.get("paid", 0), row.get("minutes", 0), row.get("used", "0 min"), row.get("energy") if row.get("energy") is not None else "Meter needed", row.get("started", "—"), row.get("returned", "—")] for row in demo_rows])
         writer.writerow([])
         writer.writerow(["Camper feedback"])
         writer.writerow(["Locker", "Date and time", "Rating (1-5)", "Feedback"])
@@ -1461,4 +1873,5 @@ def delete_report(filename):
 
 if __name__ == "__main__":
     # Intended for a trusted local kiosk network during development.
+    threading.Thread(target=weekly_report_scheduler, name="weekly-report-scheduler", daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
