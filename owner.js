@@ -316,11 +316,13 @@ async function loadFeedback() {
     $('#feedbackTotal').textContent = String(data.total);
     $('#feedbackSatisfied').textContent = String(data.satisfied);
     $('#feedbackNeedsImprovement').textContent = String(data.needs_improvement);
-    renderFeedbackChart(data.satisfied, data.needs_improvement, period);
+    $('#feedbackNoResponse').textContent = String(data.no_feedback);
+    renderFeedbackChart(data.satisfied, data.needs_improvement, data.no_feedback, data.eligible, period);
   } catch (error) { toast(error.message); }
 }
-function renderFeedbackChart(satisfied, needsImprovement, period) {
-  const total = satisfied + needsImprovement;
+function renderFeedbackChart(satisfied, needsImprovement, noFeedback, eligibleCount, period) {
+  const responses = satisfied + needsImprovement;
+  const total = Math.max(Number(eligibleCount) || 0, responses);
   const cx = 105, cy = 105, radius = 76;
   const point = angle => [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
   const wedge = (value, start, color) => {
@@ -328,16 +330,31 @@ function renderFeedbackChart(satisfied, needsImprovement, period) {
     const end = start + (value / total) * Math.PI * 2;
     const [x1, y1] = point(start), [x2, y2] = point(end);
     const large = end - start > Math.PI ? 1 : 0;
-    return `<path d="M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${large} 1 ${x2} ${y2} Z" fill="${color}" stroke="#0f2a3a" stroke-width="2"><title>${value} ${color === '#19a7a0' ? 'satisfied' : 'needs improvement'}</title></path>`;
+    return `<path d="M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${large} 1 ${x2} ${y2} Z" fill="${color}" stroke="#0f2a3a" stroke-width="2"><title>${value} ${color === '#19a7a0' ? 'satisfied' : color === '#ffbe2e' ? 'needs improvement' : 'no feedback'}</title></path>`;
   };
-  const chart = total
-    ? `${wedge(satisfied, -Math.PI / 2, '#19a7a0')}${wedge(needsImprovement, -Math.PI / 2 + satisfied / total * Math.PI * 2, '#ffbe2e')}`
-    : `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="#e8efec" stroke="#0f2a3a" stroke-width="2"/>`;
-  const description = `${period}: ${satisfied} satisfied responses and ${needsImprovement} responses needing improvement.`;
-  $('#feedbackChart').innerHTML = `<svg class="feedback-pie" viewBox="0 0 430 210" role="img" aria-label="${description}"><title>${description}</title>${chart}<g transform="translate(220 62)"><circle cx="8" cy="8" r="8" fill="#19a7a0"/><text x="26" y="13">Satisfied · 4–5 stars · ${satisfied}</text><circle cx="8" cy="42" r="8" fill="#ffbe2e"/><text x="26" y="47">Needs improvement · 1–3 stars · ${needsImprovement}</text><text x="0" y="88" class="feedback-pie-total">${total} response${total === 1 ? '' : 's'} · ${period}</text></g></svg>`;
-  $('#feedbackChartCaption').textContent = total
-    ? 'Ratings of 4–5 stars count as satisfied; ratings of 1–3 stars count as needing improvement.'
-    : `No camper feedback was submitted ${period.toLowerCase()}.`;
+  const slices = [
+    { value: satisfied, color: '#19a7a0' },
+    { value: needsImprovement, color: '#ffbe2e' },
+    { value: Math.max(0, Number(noFeedback) || 0), color: '#8995a8' }
+  ];
+  let angle = -Math.PI / 2;
+  let chart = '';
+  for (const slice of slices) {
+    const start = angle;
+    const fraction = total ? slice.value / total : 0;
+    chart += wedge(slice.value, start, slice.color);
+    if (slice.value > 0 && fraction >= 0.05) {
+      const mid = start + fraction * Math.PI;
+      const [x, y] = point(mid).map((value, index) => index === 0 ? cx + (value - cx) * 0.58 : cy + (value - cy) * 0.58);
+      const labelClass = slice.color === '#19a7a0' ? 'pie-percent pie-percent-teal' : slice.color === '#ffbe2e' ? 'pie-percent pie-percent-yellow' : 'pie-percent pie-percent-muted';
+      chart += `<text class="${labelClass}" x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle">${Math.round(fraction * 100)}%</text>`;
+    }
+    angle += fraction * Math.PI * 2;
+  }
+  if (!total) chart = `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="#e8efec" stroke="#0f2a3a" stroke-width="2"/>`;
+  const description = `${period}: ${satisfied} satisfied, ${needsImprovement} needing improvement, and ${Math.max(0, Number(noFeedback) || 0)} with no feedback, out of ${total} completed sessions.`;
+  $('#feedbackChart').innerHTML = `<svg class="feedback-pie" viewBox="0 0 430 210" role="img" aria-label="${description}"><title>${description}</title>${chart}<g transform="translate(220 42)"><circle cx="8" cy="8" r="8" fill="#19a7a0"/><text x="26" y="13">Satisfied · 4–5 stars · ${satisfied}</text><circle cx="8" cy="42" r="8" fill="#ffbe2e"/><text x="26" y="47">Needs improvement · 1–3 stars · ${needsImprovement}</text><circle cx="8" cy="76" r="8" fill="#8995a8"/><text x="26" y="81">No feedback · ${Math.max(0, Number(noFeedback) || 0)}</text><text x="0" y="116" class="feedback-pie-total">${total} completed session${total === 1 ? '' : 's'} · ${period}</text></g></svg>`;
+  $('#feedbackChartCaption').textContent = `Refreshes automatically about every 2.5 seconds. Of ${total} completed sessions, ${responses} left feedback and ${Math.max(0, Number(noFeedback) || 0)} did not. Ratings of 4–5 stars count as satisfied; 1–3 stars need improvement.`;
 }
 async function syncDemoState() {
   try {
